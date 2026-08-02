@@ -137,5 +137,5 @@ firewall.
 
 ## Licença
 
-Ainda não definida. Sem licença explícita vale o padrão legal de *todos os
-direitos reservados* — abra uma issue se quiser usar em outro contexto.
+[MIT](LICENSE) — use, modifique e distribua à vontade, mantendo o aviso de
+copyright. Sem garantia de qualquer espécie.
