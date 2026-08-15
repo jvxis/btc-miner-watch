@@ -25,10 +25,14 @@ no fim deste documento. Este projeto contorna todas elas com um coletor local.
 - **Por máquina**: série temporal própria, uptime, índice de saúde, resultado
   individual e break-even
 - **Energia** por tarifa de kWh **ou** contrato fechado em USD, com valor
-  distinto por máquina
+  distinto por máquina e período de cortesia contado do primeiro hash
 - **Indisponibilidade**: detecta quedas, calcula o crédito proporcional e gera
   relatório datado para negociar com o fornecedor
 - **P&L** por competência, em satoshis, com o preço efetivo da energia por kWh
+- **Cobrança adiantada**: prévia do mês seguinte já com o desconto das paradas
+  do mês corrente, pronta para enviar ao fornecedor
+- **Avisos no Telegram** para máquina parada, fazenda parada, falha de contato
+  com a pool e degradação prolongada
 - **Simulador** de preço do BTC, tarifa e dificuldade
 - Três tons de fósforo: P4 branco, P3 âmbar, P1 verde
 
@@ -74,6 +78,21 @@ de quedas e gráficos de alta resolução.
 Tarifa de energia, consumo em watts, hashrate nominal, apelidos e limites de
 alerta ficam na página de configurações, gravados no banco local.
 
+### Avisos no Telegram
+
+Crie um bot no `@BotFather`, pegue o token e descubra o seu chat id em
+`https://api.telegram.org/bot<TOKEN>/getUpdates` depois de mandar qualquer
+mensagem ao bot. Os dois campos ficam na página de configurações, com um botão
+de teste. Não há interruptor separado: preenchidos os dois, os avisos estão
+ligados; para silenciar, apague o chat id.
+
+Cada condição avisa uma vez quando começa e outra quando normaliza — repetir a
+cada leitura ensinaria o operador a ignorar o canal. Pelo mesmo motivo,
+condições que começam no mesmo ciclo vão numa mensagem só: uma queda geral não
+deve render uma notificação por máquina. Degradação só vira aviso depois de
+persistir além do limite configurado, porque oscilação de poucos minutos é ruído
+normal de minerador.
+
 ## Páginas
 
 | Rota | Atalho | Conteúdo |
@@ -94,6 +113,8 @@ lib/viabtc.ts    cliente da ViaBTC, com assinatura HMAC e tradução de erros
 lib/db.ts        SQLite via node:sqlite, sem dependência externa
 lib/poller.ts    coletor de snapshots e detecção de quedas
 lib/metrics.ts   motor de cálculo: energia, receita, lucro, saúde, alertas
+lib/health.ts    critério único de degradação, compartilhado por coletor e tela
+lib/notify.ts    avisos no Telegram, com memória do que já foi avisado
 lib/market.ts    preço (CoinGecko) e rede (mempool.space), com cache e fallback
 ```
 

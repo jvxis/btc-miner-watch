@@ -127,6 +127,22 @@ export function db(): DatabaseSync {
       updated        INTEGER NOT NULL
     );
 
+    -- Desde quando cada maquina esta degradada. Persistido para o alerta de
+    -- degradacao prolongada nao zerar quando o app reinicia.
+    CREATE TABLE IF NOT EXISTS miner_health (
+      worker         TEXT PRIMARY KEY,
+      degraded_since INTEGER
+    );
+
+    -- Avisos ja enviados. Sem isto, cada ciclo do coletor reenviaria a mesma
+    -- condicao e o canal viraria ruido.
+    CREATE TABLE IF NOT EXISTS notifications (
+      alert_id   TEXT PRIMARY KEY,
+      texto_fim  TEXT,
+      sent_at    INTEGER NOT NULL,
+      cleared_at INTEGER
+    );
+
     CREATE TABLE IF NOT EXISTS kv (
       key   TEXT PRIMARY KEY,
       value TEXT NOT NULL,
@@ -686,6 +702,40 @@ export function persistedOutage(month: string): { downMs: number; observedFrom: 
     .prepare('SELECT full_outage_ms, observed_from FROM outage_monthly WHERE month = ?')
     .get(month) as { full_outage_ms: number; observed_from: number | null } | undefined;
   return r ? { downMs: r.full_outage_ms, observedFrom: r.observed_from } : null;
+}
+
+/**
+ * Marca ou limpa o inicio da degradacao.
+ * So grava na transicao: enquanto a maquina segue degradada, o instante
+ * original e preservado, que e justamente o que mede a duracao.
+ */
+export function markDegraded(worker: string, degraded: boolean, at: number): void {
+  const conn = db();
+  const atual = conn.prepare('SELECT degraded_since FROM miner_health WHERE worker = ?').get(worker) as
+    | { degraded_since: number | null }
+    | undefined;
+
+  if (degraded) {
+    if (atual?.degraded_since) return;
+    conn
+      .prepare(
+        `INSERT INTO miner_health (worker, degraded_since) VALUES (?, ?)
+         ON CONFLICT(worker) DO UPDATE SET degraded_since = excluded.degraded_since`,
+      )
+      .run(worker, at);
+    return;
+  }
+
+  if (atual?.degraded_since) {
+    conn.prepare('UPDATE miner_health SET degraded_since = NULL WHERE worker = ?').run(worker);
+  }
+}
+
+export function degradedSinceMap(): Map<string, number> {
+  const rows = db()
+    .prepare('SELECT worker, degraded_since FROM miner_health WHERE degraded_since IS NOT NULL')
+    .all() as { worker: string; degraded_since: number }[];
+  return new Map(rows.map((r) => [r.worker, r.degraded_since]));
 }
 
 /** Primeira coleta dentro do periodo — inicio real da observacao. */

@@ -1,5 +1,6 @@
 import {
   avgHashrateByWorker,
+  degradedSinceMap,
   fleetSeries,
   profitDays,
   recentHashrates,
@@ -7,6 +8,7 @@ import {
   recentEvents,
 } from './db';
 import { dailyCostResolver } from './energy';
+import { fmtClock, fmtDuration } from './format';
 import { blockSubsidy, fetchMarket } from './market';
 import { pollStatus } from './poller';
 import { minerConfig, minerCost, syncMiners } from './settings';
@@ -58,7 +60,9 @@ export async function buildOverview(): Promise<OverviewPayload> {
 
   const accountInfo = await viabtc.account().catch(() => null);
 
-  const settings: Settings = syncMiners(workers.map((w) => w.worker_name));
+  const settings: Settings = syncMiners(
+    workers.map((w) => ({ worker: w.worker_name, hashing: toTh(w.hashrate_10min) > 0 })),
+  );
   const now = Date.now();
 
   const avg24 = avgHashrateByWorker(24);
@@ -66,6 +70,7 @@ export async function buildOverview(): Promise<OverviewPayload> {
   const days = profitDays(90);
   /** Janela curta que decide status e alerta — reage em minutos, nao em 1 hora. */
   const recentes = recentHashrates(15);
+  const degradadaDesde = degradedSinceMap();
 
   const fleet1h = workers.reduce((s, w) => s + toTh(w.hashrate_1hour), 0);
   const fleet10m = workers.reduce((s, w) => s + toTh(w.hashrate_10min), 0);
@@ -153,6 +158,7 @@ export async function buildOverview(): Promise<OverviewPayload> {
       breakevenBtcBrl: revenueDayBtc > 0 ? costDayBrl / revenueDayBtc : 0,
       uptime24h,
       health,
+      degradedSince: degradadaDesde.get(w.worker_name) ?? null,
       vsFleetPct: medianH > 0 ? ((h1h - medianH) / medianH) * 100 : 0,
       sparkline: sparks.get(w.worker_name) ?? [],
       onlineTime7d: w.online_time_7d ?? null,
@@ -165,6 +171,9 @@ export async function buildOverview(): Promise<OverviewPayload> {
   const nominalTh = miners.reduce((s, m) => s + m.nominalTh, 0);
   const powerKw = active.reduce((s, m) => s + m.watts, 0) / 1000;
   const kwhDay = powerKw * 24;
+  // A eficiencia medida usa a referencia curta: a media de 1h leva ate uma
+  // hora para se limpar depois de uma queda e inflaria o J/TH sem motivo.
+  const fleetRef = miners.reduce((s, m) => s + m.hashrateRef, 0);
 
   // Contrato fechado e cobrado mesmo com a maquina parada; tarifa por kWh, nao.
   const costDayBrl = miners.reduce(
@@ -194,6 +203,7 @@ export async function buildOverview(): Promise<OverviewPayload> {
   const totals: FleetTotals = {
     hashrate10m: fleet10m,
     hashrate1h: fleet1h,
+    hashrateRef: fleetRef,
     hashrate24hLocal: local24.length === miners.length && local24.length > 0 ? local24.reduce((a, b) => a + b, 0) : null,
     nominalTh,
     performance: nominalTh > 0 ? fleet1h / nominalTh : 0,
@@ -213,7 +223,9 @@ export async function buildOverview(): Promise<OverviewPayload> {
     profitDayBrl,
     profitDayUsd: revenueDayUsd - costDayUsd,
     marginPct: revenueDayBrl > 0 ? (profitDayBrl / revenueDayBrl) * 100 : 0,
-    efficiency: fleet1h > 0 ? (powerKw * 1000) / fleet1h : 0,
+    efficiency: fleetRef > 0 ? (powerKw * 1000) / fleetRef : 0,
+    efficiencyNominal:
+      nominalTh > 0 ? miners.reduce((s, m) => s + m.watts, 0) / nominalTh : 0,
     // O custo esta ancorado em dolar; dividir pelo preco do BTC da o custo em
     // satoshis, que encolhe quando o bitcoin sobe.
     revenueDaySats: revenueDayBtc * 1e8,
@@ -276,13 +288,28 @@ export async function buildOverview(): Promise<OverviewPayload> {
     // So alerta o que esta realmente abaixo agora — maquina em recuperacao
     // aparece no painel com o proprio estado, sem poluir os alertas.
     if (m.status === 'degraded' && m.performanceRef * 100 < settings.alertHashratePct) {
+      // Queda passageira e ruido; a que persiste e a que pede visita. Um
+      // alerta so, que muda de texto ao cruzar o limite, evita duplicar a
+      // mesma maquina na lista.
+      const ha = m.degradedSince !== null ? now - m.degradedSince : 0;
+      const prolongada = ha >= settings.alertDegradedMinutes * 60_000;
+      const numeros = `${m.hashrateRef.toFixed(1)} TH/s = ${(m.performanceRef * 100).toFixed(0)}% do nominal (${m.nominalTh} TH/s)`;
+      // A duracao entra desde o primeiro minuto: saber se a queda tem 3 ou 40
+      // minutos muda a decisao, mesmo antes de virar aviso prolongado.
+      const desde =
+        m.degradedSince !== null
+          ? ` · ha ${fmtDuration(ha / 1000)}, desde ${fmtClock(m.degradedSince)}`
+          : '';
+
       alerts.push({
-        id: `low:${m.worker}`,
+        id: prolongada ? `sust:${m.worker}` : `low:${m.worker}`,
         level: 'warning',
         worker: m.worker,
-        title: `${m.label} abaixo do esperado`,
-        detail: `${m.hashrateRef.toFixed(1)} TH/s = ${(m.performanceRef * 100).toFixed(0)}% do nominal (${m.nominalTh} TH/s)`,
-        since: now,
+        title: prolongada
+          ? `${m.label} degradada ha ${fmtDuration(ha / 1000)}`
+          : `${m.label} abaixo do esperado`,
+        detail: `${numeros}${desde}`,
+        since: m.degradedSince ?? now,
       });
     }
     if (m.rejectPct > settings.alertRejectPct) {
@@ -308,8 +335,10 @@ export async function buildOverview(): Promise<OverviewPayload> {
     });
   }
 
+  // Dentro do mesmo nivel, a degradacao prolongada vem antes da passageira.
   const order = { critical: 0, warning: 1, info: 2 } as const;
-  alerts.sort((a, b) => order[a.level] - order[b.level]);
+  const peso = (a: Alert) => order[a.level] * 10 + (a.id.startsWith('sust:') ? 0 : 1);
+  alerts.sort((a, b) => peso(a) - peso(b));
 
   // ------------------------------------------------------------ series
   const localChart = fleetSeries(24, 10);

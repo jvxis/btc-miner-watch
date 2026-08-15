@@ -98,6 +98,13 @@ export interface MinerConfig {
   tariffBrl: number | null;
   /** custo fechado em USD/mes desta maquina; null usa o valor global */
   fixedMonthlyUsd: number | null;
+  /** dias de cortesia a partir do primeiro hash; 0 desliga */
+  courtesyDays: number;
+  /** quando a maquina apareceu produzindo pela primeira vez */
+  firstHashAt: number | null;
+  /** quando o worker entrou na configuracao; null nas maquinas antigas, que
+   *  existiam antes deste controle e por isso sao cobradas o mes inteiro */
+  addedAt: number | null;
   /** local/rack, texto livre */
   location: string;
   enabled: boolean;
@@ -120,10 +127,15 @@ export interface Settings {
   alertRejectPct: number;
   /** minutos sem share que marcam a maquina como offline */
   alertOfflineMinutes: number;
+  /** minutos degradada seguidos que promovem o aviso de degradacao prolongada */
+  alertDegradedMinutes: number;
   /** custo mensal fixo em BRL (aluguel, internet, manutencao) rateado */
   fixedMonthlyCostBrl: number;
   /** eficiencia de referencia J/TH usada no assistente de configuracao */
   referenceJPerTh: number;
+  /** avisa no Telegram: criticos e degradacao prolongada. Preencher = ligado */
+  telegramToken: string;
+  telegramChatId: string;
   miners: MinerConfig[];
 }
 
@@ -174,6 +186,8 @@ export interface MinerView {
   uptime24h: number | null;
   /** nota 0..100 combinando desempenho, rejeicao e uptime */
   health: number;
+  /** desde quando esta degradada sem interrupcao; null se nao esta */
+  degradedSince: number | null;
   /** desvio percentual frente a mediana da fazenda */
   vsFleetPct: number;
   sparkline: { t: number; h: number }[];
@@ -218,6 +232,8 @@ export interface MarketData {
 export interface FleetTotals {
   hashrate10m: number;
   hashrate1h: number;
+  /** soma das medianas recentes — reage em minutos, nao em 1 hora */
+  hashrateRef: number;
   hashrate24hLocal: number | null;
   nominalTh: number;
   performance: number;
@@ -239,7 +255,10 @@ export interface FleetTotals {
   profitDayBrl: number;
   profitDayUsd: number;
   marginPct: number;
+  /** J/TH medido: potencia ativa sobre o hashrate de referencia */
   efficiency: number;
+  /** J/TH de projeto: potencia instalada sobre o hashrate nominal */
+  efficiencyNominal: number;
   /** Visao em satoshis: a receita nasce em sats e o custo e fixo em dolar,
    *  entao o custo em sats cai quando o bitcoin sobe. */
   revenueDaySats: number;

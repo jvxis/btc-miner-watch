@@ -399,6 +399,112 @@ function montarRelatorioParadas(month: string, dt: DowntimeReport, conta: string
   return L.join('\n');
 }
 
+interface PreviaFaixa {
+  quantidade: number;
+  cheioUsd: number;
+  totalUsd: number;
+  cobravelDesde: number | null;
+  courtesyDays: number;
+}
+
+interface Previa {
+  month: string;
+  contractUsd: number;
+  faixas: PreviaFaixa[];
+  creditFrom: string;
+  creditUsd: number;
+  creditSats: number;
+  outageHours: number;
+  creditPartial: boolean;
+  netUsd: number;
+  netSats: number;
+}
+
+/**
+ * Previa da cobranca do mes seguinte, para mandar ao host antes de ele emitir.
+ * Com cobranca adiantada, esperar a fatura chegar significa receber sem o
+ * credito das paradas — que so e abatido na competencia seguinte.
+ */
+function montarPrevia(
+  p: Previa,
+  dt: DowntimeReport | null,
+  market: { btcUsd: number; usdBrl: number },
+  conta: string,
+): string {
+  const L: string[] = [];
+  const regua = '='.repeat(58);
+  const traco = '  ' + '-'.repeat(54);
+  const dia = (t: number) => new Date(t).toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' });
+  const hhmm = (t: number) =>
+    new Date(t).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+
+  L.push(regua);
+  L.push(' PREVIA DE COBRANCA - ENERGIA');
+  L.push(` Competencia: ${mesLabel(p.month)}`);
+  L.push(` Conta na pool: ${conta}`);
+  L.push(` Emitido em: ${dm(Date.now())}`);
+  L.push(regua);
+  L.push('');
+
+  L.push('CONTRATO');
+  for (const f of p.faixas) {
+    const desc =
+      f.cobravelDesde === null
+        ? `${String(f.quantidade).padStart(2)} maquina(s), mes integral`
+        : `${String(f.quantidade).padStart(2)} maquina(s), a partir de ${dia(f.cobravelDesde)}`;
+    L.push(`  ${desc.padEnd(38)} US$ ${f.totalUsd.toFixed(2).padStart(8)}`);
+    if (f.cobravelDesde !== null) {
+      L.push(`      cortesia de ${f.courtesyDays} dias encerra em ${dia(f.cobravelDesde)}`);
+    }
+  }
+  L.push(traco);
+  L.push(linha('Subtotal', `US$ ${p.contractUsd.toFixed(2)}`, 28));
+  L.push('');
+
+  L.push(`CREDITO DE INDISPONIBILIDADE - ${mesLabel(p.creditFrom).toUpperCase()}`);
+  const eventos = dt
+    ? [...dt.importedPeriods, ...dt.measuredPeriods].sort((a, b) => a.from - b.from)
+    : [];
+  if (eventos.length === 0) {
+    L.push('  Nenhuma queda registrada ate agora.');
+  } else {
+    L.push('  Quedas totais da fazenda:');
+    for (const e of eventos) {
+      L.push(
+        `    ${hhmm(e.from)} -> ${new Date(e.to).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}` +
+          `  ${String(Math.round(e.ms / 60000)).padStart(4)} min`,
+      );
+    }
+    if (dt && dt.individualPeriods.length > 0) {
+      L.push('  Maquinas paradas fora das quedas gerais:');
+      for (const m of dt.individualPeriods) {
+        L.push(`    ${m.label.padEnd(12)} ${(m.soloMs / 3_600_000).toFixed(1).padStart(5)} h sozinha`);
+      }
+    }
+    L.push(traco);
+    L.push(linha('Total parado', `${p.outageHours.toFixed(2)} h`, 28));
+  }
+  L.push(linha('Credito apurado', `US$ ${p.creditUsd.toFixed(2)}`, 28));
+  if (p.creditPartial) {
+    L.push('');
+    L.push(`  Apurado ate ${dm(Date.now())}. ${mesLabel(p.creditFrom)} ainda esta`);
+    L.push('  em curso, entao o valor final pode aumentar.');
+  }
+  L.push('');
+
+  L.push(traco);
+  L.push(linha('A PAGAR', `US$ ${p.netUsd.toFixed(2)}`, 28));
+  L.push(linha('Em real', `R$ ${(p.netUsd * market.usdBrl).toFixed(2)}`, 28));
+  L.push(linha('Em satoshis', `${p.netSats.toLocaleString('pt-BR')} sats`, 28));
+  L.push(linha('Cotacao usada', `BTC = US$ ${Math.round(market.btcUsd).toLocaleString('pt-BR')}`, 28));
+  L.push('');
+  L.push('  Favor emitir a cobranca ja considerando o credito acima.');
+  L.push('  O valor em satoshis vale para a cotacao do momento; na hora');
+  L.push('  do pagamento eu refaco a conversao.');
+  L.push(regua);
+  return L.join('\n');
+}
+
 export function EnergyBills({
   currency,
   account = '',
@@ -430,6 +536,8 @@ export function EnergyBills({
   const [reciboCopiado, setReciboCopiado] = useState(false);
   const [relatorio, setRelatorio] = useState<string | null>(null);
   const [relatorioCopiado, setRelatorioCopiado] = useState(false);
+  const [previaDoc, setPreviaDoc] = useState<string | null>(null);
+  const [previaCopiada, setPreviaCopiada] = useState(false);
 
   const bills: BillView[] = data?.bills ?? [];
   const market = data?.market;
@@ -591,8 +699,70 @@ export function EnergyBills({
   return (
     <Panel
       title="Conta de energia paga em satoshis"
-      right={lancados.length ? `${lancados.length} mes(es) lancado(s)` : 'nenhum lancamento'}
+      right={
+        <div className="flex items-center gap-2">
+          <span>{lancados.length ? `${lancados.length} mes(es) lancado(s)` : 'nenhum lancamento'}</span>
+          {data?.previa && market && (
+            <button
+              className={`term-btn !py-[2px] !px-2 !text-[0.6rem] ${previaDoc ? 'inverse' : ''}`}
+              onClick={() =>
+                previaDoc
+                  ? setPreviaDoc(null)
+                  : setPreviaDoc(montarPrevia(data.previa, dt, market, account || 'nao informada'))
+              }
+              title="Previa da cobranca do mes seguinte, com o credito das paradas deste mes"
+            >
+              previa de {mesLabel(data.previa.month)}
+            </button>
+          )}
+        </div>
+      }
     >
+      {/* ------------------------------------------------ previa do proximo mes */}
+      {previaDoc && (
+        <div className="mb-4 border border-phos/40 p-3">
+          <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+            <span className="panel-title">
+              Previa de {data?.previa ? mesLabel(data.previa.month) : ''} — mandar antes de ele faturar
+            </span>
+            <div className="flex items-center gap-2">
+              {previaCopiada && <span className="text-[0.65rem] hot">COPIADO</span>}
+              <button
+                className="term-btn !py-[2px] !px-3 !text-[0.62rem]"
+                onClick={async () => {
+                  try {
+                    await navigator.clipboard.writeText(previaDoc);
+                    setPreviaCopiada(true);
+                    setTimeout(() => setPreviaCopiada(false), 2500);
+                  } catch {
+                    setPreviaCopiada(false);
+                  }
+                }}
+              >
+                copiar texto
+              </button>
+              <button
+                className="term-btn !py-[2px] !px-3 !text-[0.62rem]"
+                onClick={() =>
+                  data?.previa && market
+                    ? setPreviaDoc(montarPrevia(data.previa, dt, market, account || 'nao informada'))
+                    : undefined
+                }
+              >
+                atualizar
+              </button>
+              <button className="term-btn !py-[2px] !px-3 !text-[0.62rem]" onClick={() => setPreviaDoc(null)}>
+                fechar
+              </button>
+            </div>
+          </div>
+          <pre className="doc overflow-x-auto p-3 text-[0.68rem] leading-[1.45] whitespace-pre">{previaDoc}</pre>
+          <p className="mt-2 text-[0.6rem] dimmer">
+            O credito ainda esta sendo apurado — o mes corrente nao acabou. Perto do fim do mes o numero fica
+            definitivo; use <span className="dim">atualizar</span> antes de enviar.
+          </p>
+        </div>
+      )}
       {lancados.length > 0 && (
         <div className="mb-4 grid grid-cols-2 gap-3 lg:grid-cols-4">
           <Stat

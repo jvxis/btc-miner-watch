@@ -207,10 +207,19 @@ export default function PnlPage() {
                 <td>{fmtNum(l.minedSats)}</td>
                 <td
                   className={l.energiaReal ? '' : 'dim'}
-                  title={l.energiaReal ? 'fatura lancada' : 'estimativa pelo contrato'}
+                  title={
+                    l.partial
+                      ? `Parcela decorrida do mes. Fatura cheia: ${fmtNum(l.energiaMesCheioSats)} sats`
+                      : l.energiaReal
+                        ? 'fatura lancada'
+                        : 'estimativa pelo contrato'
+                  }
                 >
-                  {l.energiaReal ? '' : '≈ '}
+                  {l.energiaReal && !l.partial ? '' : '≈ '}
                   {fmtNum(l.energiaSats)}
+                  {l.partial && l.energiaMesCheioSats > l.energiaSats && (
+                    <div className="text-[0.6rem] dimmer">de {fmtNum(l.energiaMesCheioSats)} no mes</div>
+                  )}
                 </td>
                 <td className={l.descontoSats > 0 ? 'text-warn' : 'dimmer'}>
                   {l.descontoSats > 0 ? `− ${fmtNum(l.descontoSats)}` : '—'}
@@ -299,6 +308,11 @@ export default function PnlPage() {
             <p>
               O desconto por indisponibilidade ja esta abatido da energia liquida. Valores em {cur} usam a cotacao de
               agora, nao a da epoca — a pool nao guarda preco historico.
+            </p>
+            <p>
+              Na competencia em curso a energia aparece rateada pelo trecho ja decorrido, porque a fatura cobre o mes
+              inteiro enquanto a producao ainda esta na metade. Confrontar as duas diretamente mostraria prejuizo onde
+              nao ha — sobretudo agora, que o mes e cobrado adiantado.
             </p>
           </div>
         </div>

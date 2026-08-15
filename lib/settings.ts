@@ -21,8 +21,11 @@ export const DEFAULT_SETTINGS: Settings = {
   alertHashratePct: 85,
   alertRejectPct: 2,
   alertOfflineMinutes: 15,
+  alertDegradedMinutes: 60,
   fixedMonthlyCostBrl: 0,
   referenceJPerTh: DEFAULT_J_PER_TH,
+  telegramToken: '',
+  telegramChatId: '',
   miners: [],
 };
 
@@ -35,9 +38,59 @@ export function defaultMiner(worker: string): MinerConfig {
     costMode: 'inherit',
     tariffBrl: null,
     fixedMonthlyUsd: null,
+    courtesyDays: 0,
+    firstHashAt: null,
+    addedAt: null,
     location: '',
     enabled: true,
   };
+}
+
+const DIA_MS = 86_400_000;
+
+/**
+ * Fim da cortesia da maquina, contado do primeiro hash.
+ * Sem primeiro hash registrado nao ha o que contar — sao as maquinas que ja
+ * existiam antes deste controle, cobradas normalmente.
+ */
+export function courtesyEndsAt(m: MinerConfig): number | null {
+  if (m.firstHashAt === null) return null;
+  return m.firstHashAt + Math.max(0, m.courtesyDays) * DIA_MS;
+}
+
+/**
+ * Quanto a maquina custa numa competencia, em dolar.
+ *
+ * Nao se cobra antes de a maquina existir nem durante a cortesia: o mes e
+ * rateado pela fracao em que ela ficou de fato faturavel. E o mesmo criterio
+ * que o cobrador usa, com uma linha por periodo.
+ */
+export function minerMonthlyUsd(
+  settings: Settings,
+  m: MinerConfig,
+  monthStart: number,
+  monthEnd: number,
+): number {
+  const cheio = m.fixedMonthlyUsd ?? settings.fixedMonthlyUsdPerMiner;
+  const inicio = courtesyEndsAt(m);
+  if (inicio === null) return cheio;
+
+  const faturavel = Math.max(0, monthEnd - Math.max(monthStart, inicio));
+  return cheio * (faturavel / (monthEnd - monthStart));
+}
+
+/** Soma do contrato de todas as maquinas ativas numa competencia. */
+export function contractedUsdForMonth(settings: Settings, monthStart: number, monthEnd: number): number {
+  return settings.miners
+    .filter((m) => m.enabled)
+    .filter((m) => effectiveCostMode(settings, m) === 'fixedUsd')
+    .reduce((a, m) => a + minerMonthlyUsd(settings, m, monthStart, monthEnd), 0);
+}
+
+/** A maquina esta em cortesia neste instante? */
+export function inCourtesy(m: MinerConfig, at = Date.now()): boolean {
+  const fim = courtesyEndsAt(m);
+  return fim !== null && at < fim;
 }
 
 export function getSettings(): Settings {
@@ -62,13 +115,37 @@ export function saveSettings(patch: Partial<Settings>): Settings {
   return next;
 }
 
-/** Garante que toda maquina vista na pool exista na configuracao. */
-export function syncMiners(workers: string[]): Settings {
+/**
+ * Garante que toda maquina vista na pool exista na configuracao e carimba o
+ * primeiro hash.
+ *
+ * O carimbo so vale para maquinas cadastradas depois deste controle existir
+ * (`addedAt` preenchido). As que ja estavam la ficam com `firstHashAt` nulo e
+ * seguem sendo cobradas o mes inteiro — carimbar hoje faria o sistema achar
+ * que a fazenda inteira entrou agora.
+ */
+export function syncMiners(workers: { worker: string; hashing: boolean }[]): Settings {
   const current = getSettings();
-  const known = new Set(current.miners.map((m) => m.worker));
-  const added = workers.filter((w) => !known.has(w)).map(defaultMiner);
-  if (added.length === 0) return current;
-  const merged = [...current.miners, ...added].sort((a, b) => a.worker.localeCompare(b.worker));
+  const known = new Map(current.miners.map((m) => [m.worker, m]));
+  const agora = Date.now();
+  let mudou = false;
+
+  const added = workers
+    .filter((w) => !known.has(w.worker))
+    .map((w) => ({ ...defaultMiner(w.worker), addedAt: agora }));
+  if (added.length > 0) mudou = true;
+
+  const atualizados = current.miners.map((m) => {
+    const w = workers.find((x) => x.worker === m.worker);
+    if (m.firstHashAt === null && m.addedAt !== null && w?.hashing) {
+      mudou = true;
+      return { ...m, firstHashAt: agora };
+    }
+    return m;
+  });
+
+  if (!mudou) return current;
+  const merged = [...atualizados, ...added].sort((a, b) => a.worker.localeCompare(b.worker));
   return saveSettings({ miners: merged });
 }
 
@@ -107,7 +184,8 @@ export function minerCost(settings: Settings, m: MinerConfig, usdBrl: number): M
   const mode = effectiveCostMode(settings, m);
 
   if (mode === 'fixedUsd') {
-    const dayUsd = (m.fixedMonthlyUsd ?? settings.fixedMonthlyUsdPerMiner) / 30;
+    // Em cortesia a maquina consome energia mas nao gera custo.
+    const dayUsd = inCourtesy(m) ? 0 : (m.fixedMonthlyUsd ?? settings.fixedMonthlyUsdPerMiner) / 30;
     return { dayBrl: dayUsd * (usdBrl > 0 ? usdBrl : 0), dayUsd, mode, kwhDay, fixed: true };
   }
 

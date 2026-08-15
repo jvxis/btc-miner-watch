@@ -16,6 +16,8 @@ export interface BillLike {
   partial: boolean;
   /** custo ja resolvido pelo servidor: pago > faturado > estimado */
   costSats: number;
+  /** a parcela correspondente ao trecho decorrido do mes */
+  costAccruedSats: number;
   costSource: CostSource;
   costUsd: number;
   kwhMonth: number;
@@ -28,8 +30,10 @@ export interface Linha {
   month: string;
   partial: boolean;
   minedSats: number;
-  /** custo bruto, na melhor fonte disponivel */
+  /** custo do trecho decorrido — comparavel com a receita da mesma janela */
   energiaSats: number;
+  /** o mes fechado, para o caso de a competencia ainda estar correndo */
+  energiaMesCheioSats: number;
   energiaFonte: CostSource;
   /** true so quando o pagamento ja saiu e os sats estao travados */
   energiaReal: boolean;
@@ -56,7 +60,9 @@ export interface Linha {
 export function calcularLinhas(bills: BillLike[]): Linha[] {
   return bills
     .map((b) => {
-      const energiaSats = b.costSats;
+      // Num mes em curso a fatura ja cobre o mes inteiro; comparar com a
+      // receita parcial daria prejuizo onde nao existe.
+      const energiaSats = b.costAccruedSats;
       const descontoSats = b.downtime?.combinedCreditSats ?? 0;
       const energiaLiquidaSats = Math.max(0, energiaSats - descontoSats);
       const lucroSats = b.minedSats - energiaLiquidaSats;
@@ -65,6 +71,7 @@ export function calcularLinhas(bills: BillLike[]): Linha[] {
         partial: b.partial,
         minedSats: b.minedSats,
         energiaSats,
+        energiaMesCheioSats: b.costSats,
         energiaFonte: b.costSource,
         energiaReal: b.costSource === 'pago',
         descontoSats,

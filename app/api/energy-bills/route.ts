@@ -16,7 +16,14 @@ import {
   saveEnergyBill,
 } from '@/lib/db';
 import { fetchMarket } from '@/lib/market';
-import { getSettings } from '@/lib/settings';
+import {
+  contractedUsdForMonth,
+  courtesyEndsAt,
+  effectiveCostMode,
+  getSettings,
+  minerMonthlyUsd,
+} from '@/lib/settings';
+import type { Settings } from '@/lib/types';
 
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
@@ -59,6 +66,10 @@ export interface BillView {
   costSource: 'pago' | 'faturado' | 'estimado' | 'nenhum';
   /** custo DA COMPETENCIA: fatura bruta menos o credito gerado neste mes */
   costSats: number;
+  /** a parcela do custo correspondente ao trecho ja decorrido do mes.
+   *  Igual a costSats num mes fechado; e o que da para comparar com a receita
+   *  parcial enquanto o mes corre. */
+  costAccruedSats: number;
   /** CAIXA: o que saiu (ou vai sair) nesta data, ja liquido do que foi abatido */
   cashSats: number;
   /** abatimento recebido nesta fatura e de qual competencia veio */
@@ -140,18 +151,22 @@ async function payload() {
   const settings = getSettings();
   const now = currentMonth();
 
-  const contractedUsdMonth = settings.miners
-    .filter((x) => x.enabled)
-    .filter((x) => (x.costMode === 'inherit' ? settings.costModel : x.costMode) === 'fixedUsd')
-    .reduce((a, x) => a + (x.fixedMonthlyUsd ?? settings.fixedMonthlyUsdPerMiner), 0);
+  // Contrato do mes corrente, ja descontada a cortesia de quem estiver nela.
+  const mesAtual = monthBounds(now);
+  const contractedUsdMonth = contractedUsdForMonth(settings, mesAtual.start, mesAtual.end);
 
+  // O credito por parada usa o contrato do proprio mes: maquina em cortesia
+  // nao gera credito, porque nao ha custo a devolver.
   const contractedByWorker = new Map(
     settings.miners
       .filter((x) => x.enabled)
-      .filter((x) => (x.costMode === 'inherit' ? settings.costModel : x.costMode) === 'fixedUsd')
+      .filter((x) => effectiveCostMode(settings, x) === 'fixedUsd')
       .map((x) => [
         x.worker,
-        { label: x.label || x.worker, monthlyUsd: x.fixedMonthlyUsd ?? settings.fixedMonthlyUsdPerMiner },
+        {
+          label: x.label || x.worker,
+          monthlyUsd: minerMonthlyUsd(settings, x, mesAtual.start, mesAtual.end),
+        },
       ]),
   );
 
@@ -206,7 +221,11 @@ async function payload() {
     // preco do bitcoin. Depois de pago, o que vale e o sats efetivamente pago.
     const invoiceSats =
       invoiceUsd !== null && market.btcUsd > 0 ? Math.round((invoiceUsd / market.btcUsd) * 1e8) : null;
-    const est = estimateForMonth(month, contractedUsdMonth, market.btcUsd, market.usdBrl);
+    // Cada competencia tem o seu proprio contrato: cortesia e entrada de
+    // maquina fazem o valor variar de mes para mes.
+    const bounds = monthBounds(month);
+    const contratoDoMes = contractedUsdForMonth(settings, bounds.start, bounds.end);
+    const est = estimateForMonth(month, contratoDoMes, market.btcUsd, market.usdBrl);
 
     const costSource: 'pago' | 'faturado' | 'estimado' | 'nenhum' =
       satsPaid > 0 ? 'pago' : invoiceSats !== null ? 'faturado' : est ? 'estimado' : 'nenhum';
@@ -242,6 +261,11 @@ async function payload() {
     const { start: mStart, end: mEnd } = monthBounds(month);
     const horasDecorridas = Math.max(0, (Math.min(Date.now(), mEnd) - mStart) / 3_600_000);
     const kwhMonth = (wattsInstalados / 1000) * horasDecorridas;
+
+    // No mes corrente a fatura ja e do mes inteiro, mas so uma fracao dele
+    // aconteceu. Confrontar as duas coisas daria prejuizo onde nao ha.
+    const decorrido = Math.min(1, horasDecorridas / ((mEnd - mStart) / 3_600_000));
+    const costAccruedSats = Math.round(costSats * decorrido);
     const costUsd = invoiceUsd ?? (market.btcUsd > 0 ? (costSats / 1e8) * market.btcUsd : 0);
     const usdPerKwh = kwhMonth > 0 && costUsd > 0 ? costUsd / kwhMonth : null;
 
@@ -259,6 +283,7 @@ async function payload() {
       invoiceSats,
       costSource,
       costSats,
+      costAccruedSats,
       cashSats,
       creditAppliedUsd,
       creditAppliedMonth: bill?.credit_applied_month ?? null,
@@ -285,6 +310,7 @@ async function payload() {
     market,
     // Mantido para o bloco em destaque do mes corrente.
     downtime: rows.find((r) => r.partial)?.downtime ?? null,
+    previa: previaProximoMes(settings, rows.find((r) => r.partial)?.downtime ?? null, market),
     contractedUsdMonth,
     contractedSatsAtCurrentPrice:
       market.btcUsd > 0 ? Math.round((contractedUsdMonth / market.btcUsd) * 1e8) : 0,
@@ -496,6 +522,93 @@ function downtimeReport(
     totalCreditBrl: totalCreditUsd * usdBrl,
     totalCreditSats: btcUsd > 0 ? Math.round((totalCreditUsd / btcUsd) * 1e8) : 0,
     fullOutageHours: outage.downMs / 3_600_000,
+  };
+}
+
+/** Uma faixa de maquinas com o mesmo valor na competencia, para o documento. */
+export interface PreviaFaixa {
+  quantidade: number;
+  cheioUsd: number;
+  totalUsd: number;
+  /** null quando cobra o mes inteiro */
+  cobravelDesde: number | null;
+  courtesyDays: number;
+}
+
+export interface PreviaProximoMes {
+  month: string;
+  contractUsd: number;
+  faixas: PreviaFaixa[];
+  /** competencia de onde vem o credito a abater */
+  creditFrom: string;
+  creditUsd: number;
+  creditSats: number;
+  outageHours: number;
+  /** a competencia de origem do credito ainda esta correndo */
+  creditPartial: boolean;
+  netUsd: number;
+  netSats: number;
+}
+
+/**
+ * Previa da cobranca do mes seguinte.
+ *
+ * Com cobranca adiantada, o host emite a fatura antes de o mes comecar. Mandar
+ * esta previa antes evita que ela venha sem o credito das paradas — que, pela
+ * regra combinada, so e abatido na competencia seguinte.
+ */
+function previaProximoMes(
+  settings: Settings,
+  atual: DowntimeReport | null,
+  market: { btcUsd: number },
+): PreviaProximoMes | null {
+  const d = new Date();
+  const inicio = new Date(d.getFullYear(), d.getMonth() + 1, 1).getTime();
+  const fim = new Date(d.getFullYear(), d.getMonth() + 2, 1).getTime();
+  const month = `${new Date(inicio).getFullYear()}-${String(new Date(inicio).getMonth() + 1).padStart(2, '0')}`;
+
+  const elegiveis = settings.miners
+    .filter((m) => m.enabled)
+    .filter((m) => effectiveCostMode(settings, m) === 'fixedUsd');
+  if (elegiveis.length === 0) return null;
+
+  // Agrupa por valor e por data em que passa a ser cobravel: sem isso o
+  // documento viraria uma lista de 18 linhas iguais.
+  const grupos = new Map<string, PreviaFaixa>();
+  for (const m of elegiveis) {
+    const cheio = m.fixedMonthlyUsd ?? settings.fixedMonthlyUsdPerMiner;
+    const cortesiaFim = courtesyEndsAt(m);
+    const cobravelDesde = cortesiaFim !== null && cortesiaFim > inicio ? cortesiaFim : null;
+    const valor = minerMonthlyUsd(settings, m, inicio, fim);
+    const chave = `${cheio}|${cobravelDesde ?? 0}`;
+    const g = grupos.get(chave) ?? {
+      quantidade: 0,
+      cheioUsd: cheio,
+      totalUsd: 0,
+      cobravelDesde,
+      courtesyDays: m.courtesyDays,
+    };
+    g.quantidade += 1;
+    g.totalUsd += valor;
+    grupos.set(chave, g);
+  }
+
+  const faixas = [...grupos.values()].sort((a, b) => (a.cobravelDesde ?? 0) - (b.cobravelDesde ?? 0));
+  const contractUsd = faixas.reduce((a, f) => a + f.totalUsd, 0);
+  const creditUsd = atual?.combinedCreditUsd ?? 0;
+  const netUsd = Math.max(0, contractUsd - creditUsd);
+
+  return {
+    month,
+    contractUsd,
+    faixas,
+    creditFrom: currentMonth(),
+    creditUsd,
+    creditSats: atual?.combinedCreditSats ?? 0,
+    outageHours: atual?.combinedOutageHours ?? 0,
+    creditPartial: true,
+    netUsd,
+    netSats: market.btcUsd > 0 ? Math.round((netUsd / market.btcUsd) * 1e8) : 0,
   };
 }
 

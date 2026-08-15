@@ -1,8 +1,11 @@
 import {
   kvGet,
   kvSet,
+  degradedSinceMap,
   logEvent,
+  markDegraded,
   persistMonthlyDowntime,
+  recentHashrates,
   pruneOldData,
   upsertChart,
   upsertPayments,
@@ -12,7 +15,9 @@ import {
   type SnapshotRow,
 } from './db';
 import { fetchMarket } from './market';
-import { getSettings, syncMiners } from './settings';
+import { hashrateRef, isDegraded } from './health';
+import { despacharAvisos, type Aviso } from './notify';
+import { getSettings, minerConfig, syncMiners } from './settings';
 import { num, toTh, viabtc } from './viabtc';
 
 export interface PollStatus {
@@ -59,10 +64,56 @@ export async function pollOnce(): Promise<PollStatus> {
     }));
 
     writeSnapshots(ts, rows);
-    syncMiners(rows.map((r) => r.worker));
+    syncMiners(rows.map((r) => ({ worker: r.worker, hashing: r.h10m > 0 })));
 
     const settings = getSettings();
     const offlineMs = settings.alertOfflineMinutes * 60_000;
+
+    // Marca desde quando cada maquina esta degradada, pelo mesmo criterio que
+    // a tela usa. Maquina parada nao conta como degradada: e outro problema.
+    const recentes = recentHashrates(15);
+    const avisos: Aviso[] = [];
+    const degradadaDesde = degradedSinceMap();
+
+    for (const r of rows) {
+      const cfg = minerConfig(settings, r.worker);
+      const nome = cfg.label || r.worker;
+      const parada = r.status !== 'active' || ts - r.lastActive > offlineMs || r.h10m <= 0;
+      const ref = hashrateRef(recentes.get(r.worker) ?? [], r.h10m);
+      const degradada = !parada && isDegraded(settings, cfg, ref, r.reject);
+      markDegraded(r.worker, degradada, ts);
+
+      if (parada) {
+        avisos.push({
+          id: `off:${r.worker}`,
+          texto: `🔴 ${nome} OFFLINE\nSem shares ha ${Math.round((ts - r.lastActive) / 60000)} min.`,
+          textoFim: `🟢 ${nome} voltou a produzir.`,
+        });
+        continue;
+      }
+
+      // So o que persiste vira aviso: queda de poucos minutos e ruido.
+      const desde = degradadaDesde.get(r.worker);
+      if (degradada && desde && ts - desde >= settings.alertDegradedMinutes * 60_000) {
+        const pct = cfg.nominalTh > 0 ? (ref / cfg.nominalTh) * 100 : 0;
+        avisos.push({
+          id: `sust:${r.worker}`,
+          texto:
+            `🟡 ${nome} degradada ha ${Math.round((ts - desde) / 60000)} min\n` +
+            `${ref.toFixed(1)} TH/s = ${pct.toFixed(0)}% do nominal (${cfg.nominalTh} TH/s)\n` +
+            `Rejeicao ${r.reject.toFixed(2)}%.`,
+          textoFim: `🟢 ${nome} normalizou.`,
+        });
+      }
+    }
+
+    if (rows.length > 0 && rows.every((r) => r.status !== 'active' || ts - r.lastActive > offlineMs || r.h10m <= 0)) {
+      avisos.push({
+        id: 'fazenda-parada',
+        texto: `🔴 FAZENDA PARADA\nAs ${rows.length} maquinas estao sem produzir.`,
+        textoFim: '🟢 Fazenda voltou a produzir.',
+      });
+    }
     for (const r of rows) {
       const isOffline = r.status !== 'active' || ts - r.lastActive > offlineMs;
       const state = isOffline ? 'offline' : 'online';
@@ -161,6 +212,8 @@ export async function pollOnce(): Promise<PollStatus> {
     }
     if (tick % 1440 === 0) pruneOldData();
 
+    await despacharAvisos(settings, avisos);
+
     const status: PollStatus = {
       ok: true,
       message: `${rows.length} maquinas lidas`,
@@ -182,6 +235,21 @@ export async function pollOnce(): Promise<PollStatus> {
     };
     kvSet(STATUS_KEY, status);
     if (prev.consecutiveErrors === 0) logEvent('critical', 'pool_error', null, message);
+
+    // Tres falhas seguidas: passa de instabilidade momentanea a problema real.
+    if (status.consecutiveErrors >= 3) {
+      try {
+        await despacharAvisos(getSettings(), [
+          {
+            id: 'pool-inacessivel',
+            texto: `🔴 SEM CONTATO COM A VIABTC\n${message}\n${status.consecutiveErrors} tentativas seguidas.`,
+            textoFim: '🟢 Conexao com a ViaBTC restabelecida.',
+          },
+        ]);
+      } catch {
+        /* nao deixa a notificacao derrubar o coletor */
+      }
+    }
     return status;
   }
 }

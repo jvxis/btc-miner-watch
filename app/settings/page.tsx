@@ -2,8 +2,8 @@
 
 import { useState } from 'react';
 import { KeyValue, Panel, Stat } from '@/components/ui';
-import { useEvents, useOverview, useSettings } from '@/lib/client';
-import { fmtBrl, fmtDateTime, fmtMoney, fmtNum, fmtUsd } from '@/lib/format';
+import { useEvents, useNow, useOverview, useSettings } from '@/lib/client';
+import { fmtBrl, fmtDate, fmtDateTime, fmtMoney, fmtNum, fmtUsd } from '@/lib/format';
 import type { CostMode, MinerConfig, Settings } from '@/lib/types';
 
 function Field({
@@ -25,6 +25,7 @@ function Field({
 }
 
 export default function SettingsPage() {
+  const agora = useNow() || Date.parse('2026-01-01');
   const { data: loaded, mutate } = useSettings();
   const { data: overview, mutate: mutateOverview } = useOverview();
   const { data: diag } = useEvents();
@@ -32,6 +33,8 @@ export default function SettingsPage() {
   const [draft, setDraft] = useState<Settings | null>(null);
   const [saving, setSaving] = useState(false);
   const [msg, setMsg] = useState('');
+  const [testando, setTestando] = useState(false);
+  const [testeMsg, setTesteMsg] = useState('');
 
   const s = draft ?? loaded ?? null;
   if (!s) return <p className="dim caret py-8">CARREGANDO CONFIGURACOES</p>;
@@ -67,6 +70,8 @@ export default function SettingsPage() {
     }
   };
 
+  const telegramPronto = Boolean(s.telegramToken.trim() && s.telegramChatId.trim());
+
   const enabled = s.miners.filter((m) => m.enabled);
   const totalWatts = enabled.reduce((a, m) => a + m.watts, 0);
   const totalNominal = enabled.reduce((a, m) => a + m.nominalTh, 0);
@@ -74,9 +79,17 @@ export default function SettingsPage() {
   const tariffEff = s.tariffBrl * (1 + s.tariffSurchargePct / 100);
   const usdBrl = overview?.market.usdBrl ?? 0;
 
+  /** Maquina ainda dentro da janela de cortesia.
+   *  Declarada antes de quem a usa: `energyDay` invoca na hora, e um `const`
+   *  referenciado antes da propria linha lanca em tempo de execucao. */
+  const cortesiaAtiva = (m: MinerConfig) =>
+    m.courtesyDays > 0 && m.firstHashAt !== null && agora < m.firstHashAt + m.courtesyDays * 86400000;
+
   /** Custo diario de uma maquina, em BRL, no modelo que valer para ela. */
   const minerCostDayBrl = (m: MinerConfig): number => {
     const mode: CostMode = m.costMode === 'inherit' ? s.costModel : m.costMode;
+    // Em cortesia a maquina roda de graca.
+    if (mode === 'fixedUsd' && cortesiaAtiva(m)) return 0;
     if (mode === 'fixedUsd') return ((m.fixedMonthlyUsd ?? s.fixedMonthlyUsdPerMiner) / 30) * usdBrl;
     const tf = (m.tariffBrl ?? s.tariffBrl) * (1 + s.tariffSurchargePct / 100);
     return (m.watts / 1000) * 24 * tf;
@@ -89,8 +102,11 @@ export default function SettingsPage() {
   const fixedMiners = enabled.filter(isFixed);
   const fixedCount = fixedMiners.length;
   /** Soma dos contratos fechados, em USD por mes. */
-  const contractedUsdMonth = fixedMiners.reduce((a, m) => a + (m.fixedMonthlyUsd ?? s.fixedMonthlyUsdPerMiner), 0);
+  const contractedUsdMonth = fixedMiners
+    .filter((m) => !cortesiaAtiva(m))
+    .reduce((a, m) => a + (m.fixedMonthlyUsd ?? s.fixedMonthlyUsdPerMiner), 0);
   const customCount = enabled.filter((m) => m.fixedMonthlyUsd !== null).length;
+  const emCortesia = fixedMiners.filter(cortesiaAtiva).length;
 
   return (
     <div className="space-y-4">
@@ -267,7 +283,28 @@ export default function SettingsPage() {
                 onChange={(e) => set('alertOfflineMinutes', Number(e.target.value))}
               />
             </Field>
-            <Field label="Eficiencia de referencia (J/TH)" hint="usada pelo assistente que calcula os watts">
+            <Field
+              label="Minutos degradada = aviso prolongado"
+              hint="abaixo disso a queda e tratada como passageira e nao promove o alerta"
+            >
+              <input
+                type="number"
+                step="5"
+                min="5"
+                value={s.alertDegradedMinutes}
+                onChange={(e) => set('alertDegradedMinutes', Number(e.target.value))}
+              />
+            </Field>
+            <Field
+              label="Eficiencia de referencia (J/TH)"
+              hint={
+                s.miners.length > 0
+                  ? `so alimenta o botao "calcular watts por J/TH" — daria ${fmtNum(
+                      Math.round(s.miners[0].nominalTh * s.referenceJPerTh),
+                    )} W por maquina de ${s.miners[0].nominalTh} TH/s`
+                  : 'so alimenta o botao "calcular watts por J/TH"'
+              }
+            >
               <input
                 type="number"
                 step="0.1"
@@ -282,6 +319,83 @@ export default function SettingsPage() {
           </div>
         </Panel>
       </div>
+
+      {/* ---------------------------------------------------- telegram */}
+      <Panel
+        title="Avisos no Telegram"
+        right={
+          telegramPronto ? (
+            <span className="hot">■ ativo</span>
+          ) : (
+            <span className="dim">□ preencha os dois campos</span>
+          )
+        }
+      >
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Field label="Token do bot" hint="obtido no @BotFather">
+            <input
+              type="password"
+              value={s.telegramToken}
+              onChange={(e) => set('telegramToken', e.target.value)}
+              placeholder="123456:ABC-DEF..."
+              autoComplete="off"
+            />
+          </Field>
+          <Field label="Chat ID" hint="seu ID pessoal ou o do grupo; grupo comeca com sinal negativo">
+            <input
+              value={s.telegramChatId}
+              onChange={(e) => set('telegramChatId', e.target.value)}
+              placeholder="-1001234567890"
+              autoComplete="off"
+            />
+          </Field>
+        </div>
+
+        <div className="mt-3 flex flex-wrap items-center gap-3 border-t border-phos/15 pt-2">
+          <button
+            className="term-btn"
+            disabled={testando || !telegramPronto}
+            onClick={async () => {
+              setTestando(true);
+              setTesteMsg('');
+              try {
+                await save(); // o teste usa a configuracao do servidor, nao a da tela
+                const res = await fetch('/api/telegram-test', { method: 'POST' });
+                const body = await res.json();
+                setTesteMsg(res.ok ? 'MENSAGEM ENVIADA' : `ERRO: ${body.erro}`);
+              } catch (e) {
+                setTesteMsg(`ERRO: ${(e as Error).message}`);
+              } finally {
+                setTestando(false);
+                setTimeout(() => setTesteMsg(''), 6000);
+              }
+            }}
+          >
+            {testando ? 'enviando…' : 'enviar teste'}
+          </button>
+          {testeMsg && <span className={testeMsg.startsWith('ERRO') ? 'text-crit' : 'hot'}>{testeMsg}</span>}
+          <span className="ml-auto text-[0.62rem] dimmer">
+            o teste grava as configuracoes antes de enviar
+          </span>
+        </div>
+
+        <div className="mt-2 space-y-1 text-[0.62rem] dimmer">
+          <p>
+            Avisa em: <span className="dim">maquina offline</span>,{' '}
+            <span className="dim">fazenda inteira parada</span>,{' '}
+            <span className="dim">falha de contato com a pool</span> e{' '}
+            <span className="dim">degradacao acima de {s.alertDegradedMinutes} minutos</span>.
+          </p>
+          <p>
+            Cada condicao avisa uma vez quando comeca e outra quando normaliza — nao repete a cada leitura. Queda
+            passageira nao gera mensagem, e quando muita coisa cai junto tudo vai numa mensagem so.
+          </p>
+          <p>
+            Nao ha interruptor separado: com os dois campos preenchidos os avisos estao ligados. Para silenciar, apague
+            o chat id.
+          </p>
+        </div>
+      </Panel>
 
       {/* ---------------------------------------------------- maquinas */}
       <Panel
@@ -351,6 +465,7 @@ export default function SettingsPage() {
               <th>J/TH</th>
               <th>Modo de custo</th>
               <th>Fixo USD/mes</th>
+              <th>Cortesia</th>
               <th>Tarifa propria</th>
               <th>Local</th>
               <th>Custo/dia</th>
@@ -418,6 +533,37 @@ export default function SettingsPage() {
                     />
                   </td>
                   <td>
+                    <div className="flex items-center gap-1">
+                      <input
+                        type="number"
+                        step="1"
+                        min="0"
+                        value={m.courtesyDays}
+                        onChange={(e) => setMiner(m.worker, { courtesyDays: Number(e.target.value) })}
+                        disabled={mode !== 'fixedUsd'}
+                        className={`!w-[62px] ${mode !== 'fixedUsd' ? 'opacity-30' : ''}`}
+                        title="Dias sem cobranca a partir do primeiro hash"
+                      />
+                      <span className="text-[0.6rem] dimmer">d</span>
+                      {m.courtesyDays > 0 && (
+                        <span
+                          className={`text-[0.6rem] ${cortesiaAtiva(m) ? 'text-warn' : 'dimmer'}`}
+                          title={
+                            m.firstHashAt
+                              ? `Primeiro hash em ${fmtDateTime(m.firstHashAt)}`
+                              : 'Aguardando o primeiro hash para comecar a contar'
+                          }
+                        >
+                          {m.firstHashAt === null
+                            ? 'aguardando'
+                            : cortesiaAtiva(m)
+                              ? `ate ${fmtDate(m.firstHashAt + m.courtesyDays * 86400000)}`
+                              : 'encerrada'}
+                        </span>
+                      )}
+                    </div>
+                  </td>
+                  <td>
                     <input
                       type="number"
                       step="0.001"
@@ -460,6 +606,9 @@ export default function SettingsPage() {
               <td className="hot">{fmtNum(totalWatts)}</td>
               <td className="dim">{fixedCount > 0 ? `${fixedCount} fixo` : 'tarifa'}</td>
               <td className="hot">{fixedCount > 0 ? fmtUsd(contractedUsdMonth, true) : '—'}</td>
+              <td className="dim">
+                {emCortesia > 0 ? `${emCortesia} em cortesia` : ''}
+              </td>
               <td colSpan={3} className="dim">
                 {fixedCount > 0 ? `${fmtUsd(contractedUsdMonth / 30, true)}/dia contratados` : ''}
               </td>

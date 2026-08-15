@@ -163,8 +163,8 @@ export default function Dashboard() {
             <Gauge
               value={Math.max(0, Math.min(40, t.efficiency))}
               max={40}
-              redline={26}
-              label="EFICIENCIA"
+              redline={t.efficiencyNominal > 0 ? t.efficiencyNominal : 26}
+              label="EFICIENCIA MEDIDA"
               readout={t.efficiency > 0 ? t.efficiency.toFixed(1) : '—'}
               unit="J/TH"
               size={155}
@@ -201,6 +201,19 @@ export default function Dashboard() {
             </div>
           </div>
           <div className="mt-2 space-y-0.5 border-t border-phos/15 pt-2">
+            <KeyValue
+              k="J/TH de projeto"
+              v={t.efficiencyNominal > 0 ? `${t.efficiencyNominal.toFixed(2)}` : '—'}
+            />
+            <KeyValue
+              k="Perda por desempenho"
+              v={
+                t.efficiencyNominal > 0 && t.efficiency > 0
+                  ? `+${(((t.efficiency / t.efficiencyNominal) - 1) * 100).toFixed(0)}%`
+                  : '—'
+              }
+              tone={t.efficiency > t.efficiencyNominal * 1.15 ? 'warn' : undefined}
+            />
             <KeyValue k="Potencia ativa" v={`${t.powerKw.toFixed(2)} kW`} />
             <KeyValue k="Rejeicao media" v={fmtPct(t.rejectPct, 3)} tone={t.rejectPct > 2 ? 'warn' : undefined} />
             <KeyValue
