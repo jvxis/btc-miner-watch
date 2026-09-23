@@ -12,6 +12,9 @@ export const DEFAULT_NOMINAL_TH = 191;
 export const DEFAULT_J_PER_TH = 21.5;
 export const DEFAULT_WATTS = Math.round(DEFAULT_NOMINAL_TH * DEFAULT_J_PER_TH);
 
+/** Preco de partida por maquina, ajustavel uma a uma na tela de configuracoes. */
+export const DEFAULT_PURCHASE_BRL = 10_000;
+
 export const DEFAULT_SETTINGS: Settings = {
   costModel: 'tariff',
   fixedMonthlyUsdPerMiner: 0,
@@ -19,11 +22,14 @@ export const DEFAULT_SETTINGS: Settings = {
   tariffSurchargePct: 0,
   primaryCurrency: 'BRL',
   alertHashratePct: 85,
+  alertFleetPct: 90,
+  alertChronicHours: 24,
   alertRejectPct: 2,
   alertOfflineMinutes: 15,
   alertDegradedMinutes: 60,
   fixedMonthlyCostBrl: 0,
   referenceJPerTh: DEFAULT_J_PER_TH,
+  miningStartedAt: null,
   telegramToken: '',
   telegramChatId: '',
   miners: [],
@@ -33,6 +39,8 @@ export function defaultMiner(worker: string): MinerConfig {
   return {
     worker,
     label: worker,
+    purchaseBrl: DEFAULT_PURCHASE_BRL,
+    startedAt: null,
     nominalTh: DEFAULT_NOMINAL_TH,
     watts: DEFAULT_WATTS,
     costMode: 'inherit',

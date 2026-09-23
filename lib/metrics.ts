@@ -1,6 +1,7 @@
 import {
   avgHashrateByWorker,
   degradedSinceMap,
+  fleetAverage,
   fleetSeries,
   profitDays,
   recentHashrates,
@@ -8,9 +9,11 @@ import {
   recentEvents,
 } from './db';
 import { dailyCostResolver } from './energy';
+import { isOffline as offline } from './health';
 import { fmtClock, fmtDuration } from './format';
 import { blockSubsidy, fetchMarket } from './market';
 import { pollStatus } from './poller';
+import { paybackDe, retornoMedido } from './payback';
 import { minerConfig, minerCost, syncMiners } from './settings';
 import type { Alert, FleetTotals, MinerView, OverviewPayload, Settings } from './types';
 import { num, toTh, viabtc } from './viabtc';
@@ -71,13 +74,14 @@ export async function buildOverview(): Promise<OverviewPayload> {
   /** Janela curta que decide status e alerta — reage em minutos, nao em 1 hora. */
   const recentes = recentHashrates(15);
   const degradadaDesde = degradedSinceMap();
+  // Rateio da receita ja paga pela pool, dia a dia, para o payback por maquina.
+  const retorno = retornoMedido(settings);
 
   const fleet1h = workers.reduce((s, w) => s + toTh(w.hashrate_1hour), 0);
   const fleet10m = workers.reduce((s, w) => s + toTh(w.hashrate_10min), 0);
   const { btcPerThDay } = revenuePerThDay(fleet1h, days, market.difficulty, market.blockHeight);
 
   const medianH = median(workers.map((w) => toTh(w.hashrate_1hour)).filter((h) => h > 0));
-  const offlineMs = settings.alertOfflineMinutes * 60_000;
   const fixedDailyPerMiner =
     workers.length > 0 ? settings.fixedMonthlyCostBrl / 30 / workers.length : 0;
 
@@ -101,7 +105,7 @@ export async function buildOverview(): Promise<OverviewPayload> {
     const hashrateRef = amostras.length >= 3 ? median(amostras) : h10m;
     const performanceRef = cfg.nominalTh > 0 ? hashrateRef / cfg.nominalTh : 0;
 
-    const isOffline = w.worker_status !== 'active' || now - lastActive > offlineMs || h10m <= 0;
+    const isOffline = offline(settings, { lastActive, h10m }, now);
     const abaixoRef = performanceRef * 100 < settings.alertHashratePct;
     const abaixo1h = performance * 100 < settings.alertHashratePct;
     // Ja produzindo bem, mas a media de 1h ainda carrega a queda recente:
@@ -159,6 +163,7 @@ export async function buildOverview(): Promise<OverviewPayload> {
       uptime24h,
       health,
       degradedSince: degradadaDesde.get(w.worker_name) ?? null,
+      payback: paybackDe(cfg, retorno, profitDayBrl, market),
       vsFleetPct: medianH > 0 ? ((h1h - medianH) / medianH) * 100 : 0,
       sparkline: sparks.get(w.worker_name) ?? [],
       onlineTime7d: w.online_time_7d ?? null,
@@ -205,6 +210,8 @@ export async function buildOverview(): Promise<OverviewPayload> {
     hashrate1h: fleet1h,
     hashrateRef: fleetRef,
     hashrate24hLocal: local24.length === miners.length && local24.length > 0 ? local24.reduce((a, b) => a + b, 0) : null,
+    hashrate7d: fleetAverage(24 * 7),
+    hashrate30d: fleetAverage(24 * 30),
     nominalTh,
     performance: nominalTh > 0 ? fleet1h / nominalTh : 0,
     activeWorkers: account.active_workers,

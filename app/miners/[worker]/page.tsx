@@ -5,7 +5,7 @@ import { use, useState } from 'react';
 import { MinerChart } from '@/components/Charts';
 import { Gauge, KeyValue, Led, Meter, Panel, Stat } from '@/components/ui';
 import { useMiner, useNow } from '@/lib/client';
-import { fmtBtc, fmtDateTime, fmtDuration, fmtHash, fmtMoney, fmtNum, fmtPct, fmtSats } from '@/lib/format';
+import { fmtBtc, fmtDate, fmtDateTime, fmtDuration, fmtHash, fmtMoney, fmtNum, fmtPct, fmtSats } from '@/lib/format';
 import type { FleetTotals, MinerView } from '@/lib/types';
 
 const RANGES = [
@@ -180,6 +180,83 @@ export default function MinerDetail({ params }: { params: Promise<{ worker: stri
           </div>
         </Panel>
       </div>
+
+      {m.payback && (
+        <Panel
+          title="Retorno do investimento"
+          right={
+            m.payback.done
+              ? 'quitada'
+              : m.payback.daysLeft === null
+                ? 'sem lucro para projetar'
+                : `faltam ${fmtMoney(m.payback.purchaseBrl - m.payback.returnedBrl, 'BRL', true)}`
+          }
+        >
+          <div className="grid grid-cols-2 gap-2 lg:grid-cols-5">
+            <Stat label="Preco pago" value={fmtMoney(m.payback.purchaseBrl, 'BRL', true)} />
+            <Stat
+              label="Ja retornou"
+              value={fmtMoney(m.payback.returnedBrl, 'BRL', true)}
+              sub={`${fmtPct(m.payback.pct, 1)} do investimento`}
+              tone={m.payback.done ? 'normal' : 'warn'}
+            />
+            <Stat
+              label="Minerado (na carteira)"
+              value={`${fmtNum(m.payback.returnedSats)} sats`}
+              sub={`energia ${fmtMoney(m.payback.energyUsd, 'USD', true)} no periodo`}
+            />
+            <Stat
+              label="Ritmo atual"
+              value={`${fmtMoney(m.payback.profitDayBrl, 'BRL', true)}/dia`}
+              sub={`${fmtMoney(m.payback.profitDayBrl * 30, 'BRL', true)}/mes`}
+              tone={m.payback.profitDayBrl < 0 ? 'crit' : 'normal'}
+            />
+            <Stat
+              label="Previsao de quitacao"
+              value={
+                m.payback.done
+                  ? 'quitada'
+                  : m.payback.etaAt
+                    ? fmtDate(m.payback.etaAt)
+                    : '—'
+              }
+              sub={
+                m.payback.done
+                  ? 'o investimento ja voltou'
+                  : m.payback.daysLeft === null
+                    ? 'a maquina nao esta dando lucro'
+                    : `${Math.round(m.payback.daysLeft)} dias no ritmo de hoje`
+              }
+            />
+          </div>
+
+          <div className="mt-3">
+            <div className="flex justify-between text-[0.66rem]">
+              <span className="dim">PAGO</span>
+              <span className={m.payback.done ? 'hot' : ''}>{fmtPct(m.payback.pct, 1)}</span>
+            </div>
+            <div className="mt-1">
+              <Meter
+                ratio={Math.min(1, m.payback.pct / 100)}
+                tone={m.payback.done ? 'normal' : 'warn'}
+                segments={24}
+              />
+            </div>
+          </div>
+
+          <p className="mt-3 border-t border-phos/15 pt-2 text-[0.62rem] dimmer">
+            {m.payback.measuredDays} dia(s) somados{m.payback.from ? ` desde ${m.payback.from}` : ''}: a receita que a
+            pool pagou em cada dia, menos o custo de energia da maquina naquele dia. A pool paga a conta e nao o
+            worker, entao nao existe receita por maquina para consultar. Os satoshis sao valorados pela cotacao de
+            agora, nao pela do dia em que foram minerados: eles continuam na carteira, entao e a cotacao de hoje que
+            diz quanto valem — o payback sobe e desce com o BTC, como a posicao de fato faz.{' '}
+            <span className="dim">{m.payback.preciseDays} dia(s)</span> foram rateados pelo hashrate real de cada
+            uma; nos <span className="dim">{m.payback.estimatedDays} dia(s)</span> anteriores ao inicio da coleta
+            local esse dado nao existe em lugar nenhum, e a receita foi dividida entre as maquinas que ja estavam
+            ligadas. A previsao supoe o lucro de hoje daqui para frente — dificuldade e preco do BTC mudam.
+          </p>
+        </Panel>
+      )}
 
       <Panel
         title={`Hashrate — ultimas ${hours} horas (coleta local a cada minuto)`}

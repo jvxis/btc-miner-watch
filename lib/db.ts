@@ -129,6 +129,37 @@ export function db(): DatabaseSync {
 
     -- Desde quando cada maquina esta degradada. Persistido para o alerta de
     -- degradacao prolongada nao zerar quando o app reinicia.
+    -- Tempo em que a fazenda inteira produziu abaixo da faixa aceita, e a
+    -- producao que cada maquina deixou de entregar nesses periodos.
+    --
+    -- Diferente das paradas, isto nao da para refazer a partir dos snapshots
+    -- depois: depende do limite vigente em cada leitura, que o dono pode
+    -- mudar. Por isso o coletor acumula na hora.
+    CREATE TABLE IF NOT EXISTS fleet_low_monthly (
+      month    TEXT PRIMARY KEY,
+      below_ms INTEGER NOT NULL,
+      updated  INTEGER NOT NULL
+    );
+
+    -- Horas-equivalentes de parada: a fracao do nominal que faltou, vezes o
+    -- tempo. Maquina a 60% durante uma hora perde 0,4 hora-equivalente.
+    CREATE TABLE IF NOT EXISTS fleet_low_loss (
+      month   TEXT    NOT NULL,
+      worker  TEXT    NOT NULL,
+      lost_ms INTEGER NOT NULL,
+      PRIMARY KEY (month, worker)
+    );
+
+    -- Cada episodio abaixo da faixa, para o documento listar com data.
+    CREATE TABLE IF NOT EXISTS fleet_low_events (
+      from_ts  INTEGER PRIMARY KEY,
+      to_ts    INTEGER NOT NULL,
+      month    TEXT    NOT NULL,
+      below_ms INTEGER NOT NULL,
+      min_pct  REAL    NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_fleet_low_month ON fleet_low_events(month);
+
     CREATE TABLE IF NOT EXISTS miner_health (
       worker         TEXT PRIMARY KEY,
       degraded_since INTEGER
@@ -297,6 +328,44 @@ export function avgHashrateByWorker(hours: number): Map<string, { avg: number; s
   return new Map(rows.map((r) => [r.worker, { avg: r.avg, samples: r.samples, online: r.online }]));
 }
 
+/**
+ * Peso de cada maquina em cada dia, para ratear a receita diaria da pool.
+ *
+ * A soma do hashrate das leituras serve de peso porque a coleta e uniforme:
+ * uma maquina que ficou metade do dia parada soma metade. E o mesmo criterio
+ * que a pool usa para pagar, so que aplicado localmente, que e a unica forma
+ * de saber quanto cada maquina rendeu — a ViaBTC paga a conta, nao o worker.
+ */
+export function dailyWorkerWeights(sinceDays: number): Map<string, Map<string, number>> {
+  const since = Date.now() - sinceDays * 86_400_000;
+  const rows = db()
+    .prepare(
+      `SELECT strftime('%Y-%m-%d', ts / 1000, 'unixepoch', 'localtime') AS d,
+              worker, SUM(hashrate_10m) AS peso
+       FROM snapshots WHERE ts >= ? GROUP BY d, worker`,
+    )
+    .all(since) as { d: string; worker: string; peso: number }[];
+
+  const out = new Map<string, Map<string, number>>();
+  for (const r of rows) {
+    if (!out.has(r.d)) out.set(r.d, new Map());
+    out.get(r.d)!.set(r.worker, r.peso);
+  }
+  return out;
+}
+
+/** Cotacao media do BTC em cada dia observado, em BRL. */
+export function dailyBtcBrl(sinceDays: number): Map<string, number> {
+  const since = Date.now() - sinceDays * 86_400_000;
+  const rows = db()
+    .prepare(
+      `SELECT strftime('%Y-%m-%d', ts / 1000, 'unixepoch', 'localtime') AS d, AVG(btc_brl) AS v
+       FROM fleet_snapshots WHERE ts >= ? AND btc_brl > 0 GROUP BY d`,
+    )
+    .all(since) as { d: string; v: number }[];
+  return new Map(rows.map((r) => [r.d, r.v]));
+}
+
 /** Serie temporal por maquina, agrupada em buckets de N minutos. */
 export function workerSeries(worker: string, hours: number, bucketMinutes = 10): { t: number; h: number; reject: number }[] {
   const since = Date.now() - hours * 3600_000;
@@ -311,6 +380,27 @@ export function workerSeries(worker: string, hours: number, bucketMinutes = 10):
 }
 
 /** Serie temporal da fazenda inteira. */
+/**
+ * Media do hashrate da fazenda numa janela longa.
+ *
+ * Vem do hashrate da conta, nao da soma por maquina: para 7 ou 30 dias e a
+ * serie que sobrevive a poda e a mesma que alimenta o grafico. Devolve
+ * tambem quantos dias entraram de fato — uma media de 30 dias montada com
+ * 10 dias de coleta nao e a mesma coisa, e quem le precisa saber.
+ */
+export function fleetAverage(hours: number): { avg: number; days: number } | null {
+  const since = Date.now() - hours * 3600_000;
+  const r = db()
+    .prepare(
+      `SELECT AVG(hashrate_10m) AS avg, COUNT(*) AS n, MIN(ts) AS primeiro
+       FROM fleet_snapshots WHERE ts >= ? AND hashrate_10m > 0`,
+    )
+    .get(since) as { avg: number | null; n: number; primeiro: number | null };
+
+  if (!r || r.avg === null || r.n < 60 || r.primeiro === null) return null;
+  return { avg: r.avg, days: (Date.now() - r.primeiro) / 86_400_000 };
+}
+
 export function fleetSeries(hours: number, bucketMinutes = 10): { t: number; h: number; h1h: number; active: number; reject: number }[] {
   const since = Date.now() - hours * 3600_000;
   const bucket = bucketMinutes * 60_000;
@@ -498,6 +588,30 @@ const GRACE_MS = 8 * 60_000;
 const MAX_GAP_MS = 10 * 60_000;
 
 /**
+ * Parada exige duas evidencias independentes.
+ *
+ * O last_active diz QUANDO a maquina parou de enviar share, com precisao de
+ * minuto. Mas ele e contabilidade da pool, e a pool muda sem avisar: ja foi
+ * observada republicando a cada 10 minutos em vez dos 5 habituais por varios
+ * dias seguidos. Com um limite calibrado para a cadencia antiga, todas as
+ * maquinas parecem paradas ao mesmo tempo nos minutos antes de cada
+ * atualizacao, e o mes enche de "quedas totais" de 1 a 2 minutos enquanto o
+ * hashrate da conta nao se move. Ajustar os limites a cadencia medida so
+ * troca uma suposicao por outra — a pool volta a mudar.
+ *
+ * O hashrate diz SE ela parou. Nao serve para marcar o inicio — a media de 10
+ * minutos decai devagar — mas nao mente sobre o fato: maquina parada vai a
+ * zero, atraso de publicacao nao mexe nele. Entao um intervalo sem share so
+ * vira parada quando o hashrate confirma.
+ */
+export interface PisosParada {
+  /** abaixo disto, em TH/s, a maquina esta de fato sem produzir */
+  maquinaTh: number;
+  /** abaixo disto, em TH/s, a fazenda inteira esta de fato sem produzir */
+  fazendaTh: number;
+}
+
+/**
  * Tempo parado por maquina, somado intervalo a intervalo.
  *
  * Nao da para usar o hashrate: a media de 10 minutos da pool decai devagar e
@@ -510,24 +624,34 @@ const MAX_GAP_MS = 10 * 60_000;
  * parada e, no salto da volta, soma-se zero. Comparar apenas os extremos da
  * janela apagaria a queda assim que ela terminasse.
  */
-export function downtimeByWorker(since: number, until = Number.MAX_SAFE_INTEGER): WorkerDowntime[] {
+export function downtimeByWorker(
+  since: number,
+  until: number,
+  pisos: PisosParada,
+): WorkerDowntime[] {
+  // O menor hashrate dos 15 minutos que antecedem a volta: numa parada real
+  // ele passou pelo fundo; num atraso de publicacao ficou no nivel de sempre.
   const rows = db()
     .prepare(
       `WITH d AS (
          SELECT worker,
-                ts - LAG(ts) OVER (PARTITION BY worker ORDER BY ts) AS elapsed,
-                last_active - LAG(last_active) OVER (PARTITION BY worker ORDER BY ts) AS gap
+                ts - LAG(ts) OVER w AS elapsed,
+                last_active - LAG(last_active) OVER w AS gap,
+                MIN(hashrate_10m) OVER (
+                  PARTITION BY worker ORDER BY ts ROWS BETWEEN 15 PRECEDING AND CURRENT ROW
+                ) AS fundo
          FROM snapshots
          WHERE ts >= ? AND ts < ? AND last_active IS NOT NULL
+         WINDOW w AS (PARTITION BY worker ORDER BY ts)
        )
        SELECT worker,
               SUM(elapsed) AS observed,
-              SUM(CASE WHEN gap > ? THEN gap - ? ELSE 0 END) AS down
+              SUM(CASE WHEN gap > ? AND fundo < ? THEN gap - ? ELSE 0 END) AS down
        FROM d
        WHERE elapsed IS NOT NULL AND elapsed > 0 AND elapsed <= ?
        GROUP BY worker ORDER BY worker`,
     )
-    .all(since, until, GRACE_MS, REPORT_MS, MAX_GAP_MS) as {
+    .all(since, until, GRACE_MS, pisos.maquinaTh, REPORT_MS, MAX_GAP_MS) as {
     worker: string;
     observed: number;
     down: number;
@@ -539,17 +663,17 @@ export function downtimeByWorker(since: number, until = Number.MAX_SAFE_INTEGER)
   const abertas = db()
     .prepare(
       `WITH u AS (
-         SELECT worker, ts, last_active,
+         SELECT worker, ts, last_active, hashrate_10m,
                 ROW_NUMBER() OVER (PARTITION BY worker ORDER BY ts DESC) AS rn
          FROM snapshots WHERE ts >= ? AND ts < ? AND last_active IS NOT NULL
        )
-       SELECT worker, ts - last_active AS aberto FROM u WHERE rn = 1`,
+       SELECT worker, ts - last_active AS aberto, hashrate_10m AS h FROM u WHERE rn = 1`,
     )
-    .all(since, until) as { worker: string; aberto: number }[];
+    .all(since, until) as { worker: string; aberto: number; h: number }[];
 
   const emCurso = new Map(
     abertas
-      .filter((a) => a.aberto > GRACE_MS)
+      .filter((a) => a.aberto > GRACE_MS && a.h < pisos.maquinaTh)
       .map((a) => [a.worker, a.aberto - REPORT_MS]),
   );
 
@@ -641,8 +765,13 @@ export function chartOutages(
  * daqui. Como uma parada em curso so cresce, o valor gravado nunca diminui —
  * o relatorio usa sempre o maior entre o calculado e o persistido.
  */
-export function persistMonthlyDowntime(month: string, since: number, until: number): void {
-  const porWorker = downtimeByWorker(since, until);
+export function persistMonthlyDowntime(
+  month: string,
+  since: number,
+  until: number,
+  pisos: PisosParada,
+): void {
+  const porWorker = downtimeByWorker(since, until, pisos);
   if (porWorker.length === 0) return;
 
   const conn = db();
@@ -664,9 +793,9 @@ export function persistMonthlyDowntime(month: string, since: number, until: numb
     throw e;
   }
 
-  const outage = fullOutages(since, until);
+  const outage = fullOutages(since, until, pisos);
   persistOutageEvents(month, outage.periods);
-  persistMinerOutages(month, minerOutagePeriods(since, until));
+  persistMinerOutages(month, minerOutagePeriods(since, until, pisos));
   const primeira = firstSnapshotSince(since, until);
   conn
     .prepare(
@@ -695,6 +824,86 @@ export function persistedDowntime(month: string): Map<string, WorkerDowntime> {
       },
     ]),
   );
+}
+
+export interface FleetLowEvent {
+  from: number;
+  to: number;
+  belowMs: number;
+  minPct: number;
+}
+
+export interface FleetLowMonth {
+  belowMs: number;
+  perdaPorWorker: Map<string, number>;
+  eventos: FleetLowEvent[];
+}
+
+/**
+ * Soma mais um ciclo de fazenda abaixo da faixa.
+ *
+ * `deltaMs` e o tempo desde a leitura anterior, ja limitado pelo chamador:
+ * um app que ficou parado a noite inteira nao pode injetar essas horas como
+ * se tivesse medido.
+ */
+export function acumularFazendaBaixa(
+  month: string,
+  desde: number,
+  ate: number,
+  deltaMs: number,
+  pct: number,
+  perdas: { worker: string; lostMs: number }[],
+): void {
+  const conn = db();
+  const agora = Date.now();
+  conn.exec('BEGIN');
+  try {
+    conn
+      .prepare(
+        `INSERT INTO fleet_low_monthly (month, below_ms, updated) VALUES (?, ?, ?)
+         ON CONFLICT(month) DO UPDATE SET below_ms = below_ms + excluded.below_ms, updated = excluded.updated`,
+      )
+      .run(month, Math.round(deltaMs), agora);
+
+    conn
+      .prepare(
+        `INSERT INTO fleet_low_events (from_ts, to_ts, month, below_ms, min_pct) VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(from_ts) DO UPDATE SET
+           to_ts    = excluded.to_ts,
+           below_ms = fleet_low_events.below_ms + excluded.below_ms,
+           min_pct  = MIN(fleet_low_events.min_pct, excluded.min_pct)`,
+      )
+      .run(desde, ate, month, Math.round(deltaMs), pct);
+
+    const stmt = conn.prepare(
+      `INSERT INTO fleet_low_loss (month, worker, lost_ms) VALUES (?, ?, ?)
+       ON CONFLICT(month, worker) DO UPDATE SET lost_ms = lost_ms + excluded.lost_ms`,
+    );
+    for (const x of perdas) if (x.lostMs > 0) stmt.run(month, x.worker, Math.round(x.lostMs));
+    conn.exec('COMMIT');
+  } catch (e) {
+    conn.exec('ROLLBACK');
+    throw e;
+  }
+}
+
+export function fazendaBaixaDoMes(month: string): FleetLowMonth {
+  const conn = db();
+  const total = conn.prepare('SELECT below_ms FROM fleet_low_monthly WHERE month = ?').get(month) as
+    | { below_ms: number }
+    | undefined;
+  const perdas = conn
+    .prepare('SELECT worker, lost_ms FROM fleet_low_loss WHERE month = ?')
+    .all(month) as { worker: string; lost_ms: number }[];
+  const eventos = conn
+    .prepare('SELECT from_ts, to_ts, below_ms, min_pct FROM fleet_low_events WHERE month = ? ORDER BY from_ts')
+    .all(month) as { from_ts: number; to_ts: number; below_ms: number; min_pct: number }[];
+
+  return {
+    belowMs: total?.below_ms ?? 0,
+    perdaPorWorker: new Map(perdas.map((r) => [r.worker, r.lost_ms])),
+    eventos: eventos.map((r) => ({ from: r.from_ts, to: r.to_ts, belowMs: r.below_ms, minPct: r.min_pct })),
+  };
 }
 
 export function persistedOutage(month: string): { downMs: number; observedFrom: number | null } | null {
@@ -748,18 +957,22 @@ export function firstSnapshotSince(since: number, until = Number.MAX_SAFE_INTEGE
 
 export function fullOutages(
   since: number,
-  until = Number.MAX_SAFE_INTEGER,
+  until: number,
+  pisos: PisosParada,
 ): { downMs: number; intervals: number; periods: OutagePeriod[] } {
+  // Fazenda parada: nenhuma maquina enviando share E o hashrate da conta
+  // abaixo do piso naquele mesmo ciclo. A leitura da conta e gravada no mesmo
+  // instante das maquinas, entao o encontro e pelo ts exato.
   const rows = db()
     .prepare(
-      `SELECT ts,
+      `SELECT s.ts AS ts,
               COUNT(*) AS n,
-              SUM(CASE WHEN ts - last_active > ? THEN 1 ELSE 0 END) AS down
-       FROM snapshots
-       WHERE ts >= ? AND ts < ? AND last_active IS NOT NULL
-       GROUP BY ts ORDER BY ts`,
+              SUM(CASE WHEN s.ts - s.last_active > ? AND f.hashrate_10m < ? THEN 1 ELSE 0 END) AS down
+       FROM snapshots s JOIN fleet_snapshots f ON f.ts = s.ts
+       WHERE s.ts >= ? AND s.ts < ? AND s.last_active IS NOT NULL
+       GROUP BY s.ts ORDER BY s.ts`,
     )
-    .all(GRACE_MS, since, until) as { ts: number; n: number; down: number }[];
+    .all(GRACE_MS, pisos.fazendaTh, since, until) as { ts: number; n: number; down: number }[];
 
   if (rows.length < 2) return { downMs: 0, intervals: 0, periods: [] };
 
@@ -805,14 +1018,19 @@ export interface MinerOutage extends OutagePeriod {
  * Paradas de cada maquina no periodo. Uma maquina esta parada enquanto o
  * ultimo share estiver mais distante que a tolerancia de republicacao.
  */
-export function minerOutagePeriods(since: number, until: number): MinerOutage[] {
+export function minerOutagePeriods(since: number, until: number, pisos: PisosParada): MinerOutage[] {
   const rows = db()
     .prepare(
-      `SELECT worker, ts, CASE WHEN ts - last_active > ? THEN 1 ELSE 0 END AS down
+      `SELECT worker, ts,
+              CASE WHEN ts - last_active > ?
+                    AND MIN(hashrate_10m) OVER (
+                          PARTITION BY worker ORDER BY ts ROWS BETWEEN 15 PRECEDING AND CURRENT ROW
+                        ) < ?
+                   THEN 1 ELSE 0 END AS down
        FROM snapshots WHERE ts >= ? AND ts < ? AND last_active IS NOT NULL
        ORDER BY worker, ts`,
     )
-    .all(GRACE_MS, since, until) as { worker: string; ts: number; down: number }[];
+    .all(GRACE_MS, pisos.maquinaTh, since, until) as { worker: string; ts: number; down: number }[];
 
   const out: MinerOutage[] = [];
   let atual: MinerOutage | null = null;

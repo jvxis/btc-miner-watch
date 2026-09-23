@@ -267,6 +267,41 @@ export default function SettingsPage() {
                 onChange={(e) => set('alertHashratePct', Number(e.target.value))}
               />
             </Field>
+            <Field
+              label="Hashrate minimo da fazenda (%)"
+              hint="so avisa no telegram se o conjunto ficar abaixo disso pelo mesmo tempo"
+            >
+              <input
+                type="number"
+                step="1"
+                value={s.alertFleetPct}
+                onChange={(e) => set('alertFleetPct', Number(e.target.value))}
+              />
+            </Field>
+            <Field
+              label="Inicio da operacao"
+              hint="primeiro dia de mineracao; o payback so alcanca ate aqui"
+            >
+              <input
+                type="date"
+                value={s.miningStartedAt ? new Date(s.miningStartedAt).toLocaleDateString('sv-SE') : ''}
+                onChange={(e) =>
+                  set('miningStartedAt', e.target.value ? new Date(`${e.target.value}T12:00:00`).getTime() : null)
+                }
+              />
+            </Field>
+            <Field
+              label="Janela do aviso cronico (h)"
+              hint="media da fazenda nessa janela, e ha quanto tempo a maquina esta degradada"
+            >
+              <input
+                type="number"
+                step="1"
+                min="1"
+                value={s.alertChronicHours}
+                onChange={(e) => set('alertChronicHours', Number(e.target.value))}
+              />
+            </Field>
             <Field label="Rejeicao maxima (%)" hint="reject rate acima disso gera aviso">
               <input
                 type="number"
@@ -387,8 +422,20 @@ export default function SettingsPage() {
             <span className="dim">degradacao acima de {s.alertDegradedMinutes} minutos</span>.
           </p>
           <p>
+            A degradacao de uma maquina so vira mensagem quando a fazenda inteira tambem estiver abaixo de{' '}
+            {s.alertFleetPct}% do nominal pelo mesmo tempo — recuperacoes de menos de 15 minutos nao zeram essa
+            contagem, senao o aviso nunca sairia numa fazenda que oscila. Uma unidade oscilando sozinha e rotina e fica no
+            painel; o que interrompe alguem e o conjunto caindo. Avisada uma vez, a maquina so encerra quando ela
+            propria normaliza.
+          </p>
+          <p>
             Cada condicao avisa uma vez quando comeca e outra quando normaliza — nao repete a cada leitura. Queda
             passageira nao gera mensagem, e quando muita coisa cai junto tudo vai numa mensagem so.
+          </p>
+          <p>
+            Um terceiro aviso cobre o problema cronico: media da fazenda abaixo de {s.alertFleetPct}% ao longo de{' '}
+            {s.alertChronicHours}h com alguma maquina degradada ha o mesmo tempo. Vem numa mensagem so, com a media
+            medida, a esperada e quem esta puxando o numero para baixo.
           </p>
           <p>
             Nao ha interruptor separado: com os dois campos preenchidos os avisos estao ligados. Para silenciar, apague
@@ -402,6 +449,18 @@ export default function SettingsPage() {
         title={`Maquinas (${s.miners.length})`}
         right={
           <div className="flex flex-wrap gap-1">
+            <button
+              className="term-btn !py-[2px] !px-2"
+              onClick={() => {
+                const v = prompt(
+                  'Preco pago por maquina (R$), para todas:',
+                  String(s.miners[0]?.purchaseBrl ?? 10000),
+                );
+                if (v) applyToAll({ purchaseBrl: Number(v) });
+              }}
+            >
+              preco p/ todas
+            </button>
             <button
               className="term-btn !py-[2px] !px-2"
               onClick={() => {
@@ -460,6 +519,8 @@ export default function SettingsPage() {
             <tr>
               <th>Worker</th>
               <th>Apelido</th>
+              <th>Preco pago R$</th>
+              <th>Entrou em</th>
               <th>Nominal TH/s</th>
               <th>Watts</th>
               <th>J/TH</th>
@@ -483,6 +544,34 @@ export default function SettingsPage() {
                       value={m.label}
                       onChange={(e) => setMiner(m.worker, { label: e.target.value })}
                       className="!w-[140px]"
+                    />
+                  </td>
+                  <td>
+                    <input
+                      type="number"
+                      step="100"
+                      value={m.purchaseBrl}
+                      onChange={(e) => setMiner(m.worker, { purchaseBrl: Number(e.target.value) })}
+                      className="!w-[100px]"
+                    />
+                  </td>
+                  <td>
+                    <input
+                      type="date"
+                      value={
+                        m.startedAt
+                          ? new Date(m.startedAt).toLocaleDateString('sv-SE')
+                          : m.firstHashAt
+                            ? new Date(m.firstHashAt).toLocaleDateString('sv-SE')
+                            : ''
+                      }
+                      onChange={(e) =>
+                        setMiner(m.worker, {
+                          startedAt: e.target.value ? new Date(`${e.target.value}T12:00:00`).getTime() : null,
+                        })
+                      }
+                      className="!w-[130px] !text-[0.68rem]"
+                      title="Vazio = desde o inicio da operacao"
                     />
                   </td>
                   <td>

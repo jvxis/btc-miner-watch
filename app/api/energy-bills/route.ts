@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import {
+  fazendaBaixaDoMes,
   chartOutages,
   deleteEnergyBill,
   downtimeByWorker,
@@ -14,7 +15,9 @@ import {
   persistedDowntime,
   persistedOutage,
   saveEnergyBill,
+  type PisosParada,
 } from '@/lib/db';
+import { pisosDeParada } from '@/lib/health';
 import { fetchMarket } from '@/lib/market';
 import {
   contractedUsdForMonth,
@@ -157,18 +160,29 @@ async function payload() {
 
   // O credito por parada usa o contrato do proprio mes: maquina em cortesia
   // nao gera credito, porque nao ha custo a devolver.
-  const contractedByWorker = new Map(
-    settings.miners
-      .filter((x) => x.enabled)
-      .filter((x) => effectiveCostMode(settings, x) === 'fixedUsd')
-      .map((x) => [
-        x.worker,
-        {
-          label: x.label || x.worker,
-          monthlyUsd: minerMonthlyUsd(settings, x, mesAtual.start, mesAtual.end),
-        },
-      ]),
-  );
+  /**
+   * Contrato de cada maquina numa competencia.
+   *
+   * Precisa ser refeito por mes: a cortesia comeca e termina no meio, entao o
+   * valor de agosto nao e o de setembro. Um mapa unico, montado com o mes
+   * corrente, cobrava de agosto o rateio de setembro e fazia maquina em
+   * cortesia aparecer com credito de parada.
+   */
+  const contratosDoMes = (mes: string) => {
+    const { start, end } = monthBounds(mes);
+    return new Map(
+      settings.miners
+        .filter((x) => x.enabled)
+        .filter((x) => effectiveCostMode(settings, x) === 'fixedUsd')
+        .map((x) => [
+          x.worker,
+          {
+            label: x.label || x.worker,
+            monthlyUsd: minerMonthlyUsd(settings, x, start, end),
+          },
+        ]),
+    );
+  };
 
   // Quanto o cobrador concedeu por cada competencia, lido dos abatimentos que
   // ele aplicou nas faturas. E este numero, e nao o que medimos, que altera o
@@ -246,7 +260,14 @@ async function payload() {
     const creditAppliedSats = creditAppliedUsd ? Math.round(creditAppliedUsd * satsPorDolar) : 0;
 
     // A nossa medicao de parada e apenas referencia para conferir a fatura.
-    const dtMes = downtimeReport(month, contractedByWorker, market.btcUsd, market.usdBrl);
+    const dtMes = downtimeReport(
+      month,
+      contratosDoMes(month),
+      market.btcUsd,
+      market.usdBrl,
+      settings.alertFleetPct,
+      pisosDeParada(settings),
+    );
     const creditEarnedSats = dtMes?.combinedCreditSats ?? 0;
 
     // COMPETENCIA: devolve o abatimento que pertence a outro mes e desconta o
@@ -366,6 +387,30 @@ export interface DowntimeReport {
   combinedOutageHours: number;
   combinedCreditUsd: number;
   combinedCreditSats: number;
+  /** desempenho: tempo e valor da fazenda produzindo abaixo da faixa aceita */
+  lowFleet: LowFleetReport;
+}
+
+/**
+ * Fazenda inteira produzindo abaixo da faixa aceita.
+ *
+ * Nao e credito de energia: a maquina degradada consumiu a potencia quase
+ * toda. E uma perda de entrega, medida em hora e em dinheiro, para a conversa
+ * com o host sair da percepcao e ir para o dado.
+ */
+export interface LowFleetReport {
+  /** limite vigente, % do nominal somado */
+  thresholdPct: number;
+  /** tempo total abaixo do limite, em horas */
+  hours: number;
+  /** producao perdida convertida em horas-equivalentes de maquina parada */
+  lostEquivHours: number;
+  suggestedUsd: number;
+  suggestedBrl: number;
+  suggestedSats: number;
+  events: { from: number; to: number; belowMs: number; minPct: number }[];
+  /** por maquina, so as que deixaram de entregar algo */
+  byWorker: { worker: string; label: string; lostEquivHours: number; usd: number }[];
 }
 
 /**
@@ -380,6 +425,8 @@ function downtimeReport(
   contractedByWorker: Map<string, { label: string; monthlyUsd: number }>,
   btcUsd: number,
   usdBrl: number,
+  fleetPct: number,
+  pisos: PisosParada,
 ): DowntimeReport | null {
   const { start: startOfMonth, end: endOfMonth } = monthBounds(month);
   const hoursInMonth = (endOfMonth - startOfMonth) / 3_600_000;
@@ -389,7 +436,7 @@ function downtimeReport(
 
   // O consolidado gravado sobrevive a poda dos snapshots; ficamos com o maior
   // entre o que ainda da para calcular e o que ja foi registrado.
-  const vivo = downtimeByWorker(startOfMonth, until);
+  const vivo = downtimeByWorker(startOfMonth, until, pisos);
   const gravado = persistedDowntime(month);
   const workers = new Set([...vivo.map((r) => r.worker), ...gravado.keys()]);
 
@@ -428,7 +475,7 @@ function downtimeReport(
 
   const totalCreditUsd = miners.reduce((a, m) => a + m.creditUsd, 0);
   const gravadoOutage = persistedOutage(month);
-  const vivoOutage = fullOutages(startOfMonth, until);
+  const vivoOutage = fullOutages(startOfMonth, until, pisos);
   const outage = {
     downMs: Math.max(vivoOutage.downMs, gravadoOutage?.downMs ?? 0),
   };
@@ -467,7 +514,16 @@ function downtimeReport(
 
   // Quedas do historico da pool, restritas ao trecho anterior ao inicio da
   // nossa coleta — o que veio depois ja esta medido e contaria duas vezes.
-  const observedFrom = firstSnapshotSince(startOfMonth, until) ?? gravadoOutage?.observedFrom ?? null;
+  // A poda apaga os snapshots com mais de 45 dias, entao o primeiro que ainda
+  // existe nao e o inicio da observacao — o gravado e. Preferir o vivo faz o
+  // inicio de um mes fechado "andar" para a frente assim que ele completa 45
+  // dias, e o trecho descartado volta a ser importado da serie da pool por
+  // cima do que ja tinha sido medido: horas contadas duas vezes e credito
+  // inflado num mes ja acertado. Vale o mais antigo dos dois.
+  const vivoDesde = firstSnapshotSince(startOfMonth, until);
+  const gravadoDesde = gravadoOutage?.observedFrom ?? null;
+  const observedFrom =
+    vivoDesde !== null && gravadoDesde !== null ? Math.min(vivoDesde, gravadoDesde) : (vivoDesde ?? gravadoDesde);
   const limite = observedFrom ?? until;
   const dezMin = chartOutages('min', startOfMonth, limite);
   const horaria = chartOutages('hour', startOfMonth, limite);
@@ -490,6 +546,34 @@ function downtimeReport(
   const importedMs = importado.periods.reduce((a, p) => a + p.ms, 0);
   const importedHours = importedMs / 3_600_000;
 
+  // Desempenho abaixo da faixa: acumulado pelo coletor, valorado aqui com o
+  // contrato vigente — o mesmo custo por hora que vale para as paradas.
+  const baixa = fazendaBaixaDoMes(month);
+  const lowByWorker = [...baixa.perdaPorWorker.entries()]
+    .map(([worker, lostMs]) => {
+      const cfg = contractedByWorker.get(worker);
+      const lostEquivHours = lostMs / 3_600_000;
+      return {
+        worker,
+        label: cfg?.label ?? worker,
+        lostEquivHours,
+        usd: ((cfg?.monthlyUsd ?? 0) / hoursInMonth) * lostEquivHours,
+      };
+    })
+    .filter((x) => x.lostEquivHours > 0.01)
+    .sort((a, b) => b.lostEquivHours - a.lostEquivHours);
+  const lowUsd = lowByWorker.reduce((a, x) => a + x.usd, 0);
+  const lowFleet: LowFleetReport = {
+    thresholdPct: fleetPct,
+    hours: baixa.belowMs / 3_600_000,
+    lostEquivHours: lowByWorker.reduce((a, x) => a + x.lostEquivHours, 0),
+    suggestedUsd: lowUsd,
+    suggestedBrl: lowUsd * usdBrl,
+    suggestedSats: btcUsd > 0 ? Math.round((lowUsd / btcUsd) * 1e8) : 0,
+    events: baixa.eventos,
+    byWorker: lowByWorker,
+  };
+
   // Queda total derruba a fazenda inteira: o credito e o contrato cheio.
   const contratoTotalUsd = [...contractedByWorker.values()].reduce((a, x) => a + x.monthlyUsd, 0);
   const creditoHora = contratoTotalUsd / hoursInMonth;
@@ -506,6 +590,7 @@ function downtimeReport(
     combinedOutageHours,
     combinedCreditUsd,
     combinedCreditSats: btcUsd > 0 ? Math.round((combinedCreditUsd / btcUsd) * 1e8) : 0,
+    lowFleet,
     worstDownHours: comParada.length ? Math.max(...comParada.map((m) => m.downHours)) : 0,
     avgDownHours: comParada.length
       ? comParada.reduce((a, m) => a + m.downHours, 0) / comParada.length
@@ -548,6 +633,20 @@ export interface PreviaProximoMes {
   creditPartial: boolean;
   netUsd: number;
   netSats: number;
+  /**
+   * Abatimento sugerido por desempenho, apresentado a parte.
+   *
+   * Fica fora do `netUsd` de proposito: o credito de parada e aritmetica que
+   * o host aceita ou contesta com os proprios dados, enquanto isto e uma
+   * proposta de negociacao. Misturar os dois enfraquece o primeiro.
+   */
+  lowFleetHours: number;
+  lowFleetPct: number;
+  lowFleetUsd: number;
+  lowFleetSats: number;
+  /** o que sobraria se o host aceitasse tambem o abatimento por desempenho */
+  netComDesempenhoUsd: number;
+  netComDesempenhoSats: number;
 }
 
 /**
@@ -598,6 +697,9 @@ function previaProximoMes(
   const creditUsd = atual?.combinedCreditUsd ?? 0;
   const netUsd = Math.max(0, contractUsd - creditUsd);
 
+  const lowUsd = atual?.lowFleet.suggestedUsd ?? 0;
+  const netComDesempenho = Math.max(0, netUsd - lowUsd);
+
   return {
     month,
     contractUsd,
@@ -609,6 +711,12 @@ function previaProximoMes(
     creditPartial: true,
     netUsd,
     netSats: market.btcUsd > 0 ? Math.round((netUsd / market.btcUsd) * 1e8) : 0,
+    lowFleetHours: atual?.lowFleet.hours ?? 0,
+    lowFleetPct: atual?.lowFleet.thresholdPct ?? 0,
+    lowFleetUsd: lowUsd,
+    lowFleetSats: atual?.lowFleet.suggestedSats ?? 0,
+    netComDesempenhoUsd: netComDesempenho,
+    netComDesempenhoSats: market.btcUsd > 0 ? Math.round((netComDesempenho / market.btcUsd) * 1e8) : 0,
   };
 }
 

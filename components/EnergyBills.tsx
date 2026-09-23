@@ -42,6 +42,19 @@ interface DowntimeReport {
   combinedOutageHours: number;
   combinedCreditUsd: number;
   combinedCreditSats: number;
+  lowFleet: LowFleet;
+}
+
+/** Fazenda produzindo abaixo da faixa: perda de entrega, nao de energia. */
+interface LowFleet {
+  thresholdPct: number;
+  hours: number;
+  lostEquivHours: number;
+  suggestedUsd: number;
+  suggestedBrl: number;
+  suggestedSats: number;
+  events: { from: number; to: number; belowMs: number; minPct: number }[];
+  byWorker: { worker: string; label: string; lostEquivHours: number; usd: number }[];
 }
 
 interface CostEstimate {
@@ -124,15 +137,59 @@ const linha = (rotulo: string, valor: string, largura = 30) =>
 const dm = (t: number) =>
   new Date(t).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
 
+/**
+ * Copia texto para a area de transferencia.
+ *
+ * `navigator.clipboard` so existe em contexto seguro — HTTPS ou localhost.
+ * Este painel roda em HTTP numa rede privada, entao ali ele e `undefined` e
+ * o botao falhava em silencio. O caminho antigo, com textarea fora da tela e
+ * `execCommand`, e feio mas funciona em contexto inseguro, que e justamente
+ * onde o outro nao funciona.
+ */
+async function copiarTexto(texto: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(texto);
+      return true;
+    }
+  } catch {
+    // cai no plano B
+  }
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = texto;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.top = '-9999px';
+    document.body.appendChild(ta);
+    ta.select();
+    ta.setSelectionRange(0, texto.length);
+    const ok = document.execCommand('copy');
+    document.body.removeChild(ta);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
 const hm = (t: number) => new Date(t).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
 
 /**
- * Extrato de indisponibilidade em texto puro: serve tanto para print quanto
- * para copiar e colar. Evita acentos e caracteres de desenho para nao quebrar
- * em aplicativos de mensagem.
+ * Extrato da fatura de uma competencia, em texto puro.
+ *
+ * A energia e cobrada adiantada e o desconto das paradas so cai na
+ * competencia seguinte. Entao a fatura de setembro e o contrato de setembro
+ * menos o que parou em agosto — e e isso que este documento mostra, com o mes
+ * anterior ja fechado. E a foto final da previa enviada antes de o mes
+ * comecar, nos mesmos termos e na mesma ordem, para o host conferir uma
+ * contra a outra sem precisar traduzir nada.
+ *
+ * Evita acentos e caracteres de desenho para nao quebrar em aplicativos de
+ * mensagem.
  */
 function montarExtrato(
   bill: BillView,
+  anterior: BillView | null,
   market: { btcUsd: number; btcBrl: number; usdBrl: number },
   contratoUsd: number,
   conta: string,
@@ -142,101 +199,223 @@ function montarExtrato(
   const traco = '  ' + '-'.repeat(52);
   const mes = mesLabel(bill.month);
   const dt = bill.downtime;
-  const doMes = dt !== null;
+  /** O que sustenta o desconto desta fatura: a medicao do mes anterior. */
+  const base = anterior?.downtime ?? null;
+  const mesBase = anterior ? mesLabel(anterior.month) : null;
+
+  // Contrato da competencia, na melhor fonte disponivel: o que o host
+  // faturou, senao a projecao do mes, senao o contrato vigente.
+  const contratoMes = bill.invoiceUsd ?? bill.estimate?.fullMonthUsd ?? contratoUsd;
+  /**
+   * Satoshis de um valor em dolar, na cotacao deste instante.
+   *
+   * Os campos em sats que vem da API foram convertidos quando o payload foi
+   * montado; um documento emitido meia hora depois mostraria numeros de duas
+   * cotacoes diferentes. Tudo aqui e derivado na hora, e o documento diz qual
+   * cotacao usou.
+   */
+  const sats = (usd: number) => (market.btcUsd > 0 ? Math.round((usd / market.btcUsd) * 1e8) : 0);
+  const emSats = (usd: number) => `${sats(usd).toLocaleString('pt-BR')} sats`;
+  const creditoUsd = base?.combinedCreditUsd ?? 0;
+  const aPagarUsd = Math.max(0, contratoMes - creditoUsd);
 
   L.push(regua);
-  L.push(' EXTRATO DE INDISPONIBILIDADE - MINER-WATCH');
+  L.push(' EXTRATO DE ENERGIA - MINER-WATCH');
   L.push(` Competencia: ${mes}${bill.partial ? '  (mes em curso)' : ''}`);
   L.push(` Conta na pool: ${conta}`);
   L.push(` Emitido em: ${dm(Date.now())}`);
   L.push(regua);
   L.push('');
 
-  if (doMes && dt) {
-    const custoHora = dt.hoursInMonth > 0 ? contratoUsd / dt.hoursInMonth : 0;
-    L.push('CONTRATO DE ENERGIA');
+  L.push('CONTRATO DE ENERGIA');
+  L.push(linha('Competencia', mes));
+  L.push(linha('Valor do mes', `US$ ${contratoMes.toFixed(2)}`));
+  if (dt) {
     L.push(linha('Maquinas', String(dt.miners.length)));
-    L.push(linha('Custo contratado', `US$ ${contratoUsd.toFixed(2)} / mes`));
-    L.push(linha('Horas no mes', dt.hoursInMonth.toFixed(0)));
-    L.push(linha('Custo por hora', `US$ ${custoHora.toFixed(4)}`));
-    L.push('');
-
-    L.push('PERIODO OBSERVADO');
-    L.push(linha('Competencia', `${dm(dt.since)} a ${dm(dt.until)}`));
-    L.push(linha('Medicao propria desde', dt.observedFrom ? dm(dt.observedFrom) : 'sem medicao'));
-    if (dt.importedFrom) L.push(linha('Historico da pool desde', dm(dt.importedFrom)));
-    L.push(linha('Cobertura', `${dt.coverageHours.toFixed(1)}h de ${dt.hoursInMonth.toFixed(0)}h`));
-    L.push('');
-
-    const temQueda = dt.importedPeriods.length > 0 || dt.fullOutageHours > 0;
-    L.push('QUEDAS TOTAIS DA FAZENDA');
-    if (!temQueda) {
-      L.push('  Nenhuma registrada no periodo observado.');
-    } else {
-      for (const p of dt.importedPeriods) {
-        L.push(`  ${dm(p.from)} -> ${hm(p.to)}   ${String(Math.round(p.ms / 60000)).padStart(4)} min   (historico da pool)`);
-      }
-      if (dt.fullOutageHours > 0) {
-        L.push(`  ${String(Math.round(dt.fullOutageHours * 60)).padStart(4)} min em quedas medidas pelo coletor`);
-      }
-      L.push(traco);
-      L.push(linha('Total de fazenda parada', `${dt.combinedOutageHours.toFixed(2)} h`));
+    const cortesia = dt.miners.filter((m) => m.monthlyUsd <= 0);
+    if (cortesia.length > 0) {
+      L.push(linha('Em cortesia', `${cortesia.length} maquina(s), sem custo`));
+      L.push(`  ${cortesia.map((m) => m.label).join(', ')}`);
     }
+  }
+  L.push('');
+
+  // ---------------------------------------------- desconto do mes anterior
+  if (base && mesBase) {
+    L.push(`CREDITO DE INDISPONIBILIDADE - ${mesBase.toUpperCase()}`);
+    L.push(linha('Periodo apurado', `${dm(base.since)} a ${dm(base.until)}`));
+    L.push(linha('Medicao propria desde', base.observedFrom ? dm(base.observedFrom) : 'sem medicao'));
+    L.push(linha('Cobertura', `${base.coverageHours.toFixed(1)}h de ${base.hoursInMonth.toFixed(0)}h`));
     L.push('');
 
-    const paradas = dt.miners.filter((m) => m.downHours > 0.01);
-    if (paradas.length > 0) {
-      L.push('PARADA POR MAQUINA (medida)');
-      for (const m of paradas) {
+    const eventos = [
+      ...base.importedPeriods.map((x) => ({ ...x, fonte: 'historico da pool' })),
+      ...base.measuredPeriods.map((x) => ({ ...x, fonte: 'medido pelo coletor' })),
+    ].sort((a, b) => a.from - b.from);
+
+    L.push(`  Quedas totais da fazenda (${eventos.length}):`);
+    if (eventos.length === 0) {
+      L.push('    Nenhuma registrada no periodo.');
+    } else {
+      for (const e of eventos) {
         L.push(
-          `  ${m.label.padEnd(12)} ${m.downHours.toFixed(2).padStart(6)} h   ` +
-            `US$ ${String(m.monthlyUsd).padStart(4)}/mes   credito US$ ${m.creditUsd.toFixed(3)}`,
+          `    ${dm(e.from)} -> ${hm(e.to)}   ${String(Math.round(e.ms / 60000)).padStart(4)} min   ${e.fonte}`,
         );
       }
-      L.push(traco);
-      L.push(linha('Horas-maquina paradas', `${dt.totalDownHours.toFixed(2)} h`));
-      L.push('');
     }
 
-    L.push('CREDITO REIVINDICADO');
-    L.push(linha('Base de calculo', 'horas paradas x custo por hora'));
-    L.push(linha('Valor em dolar', `US$ ${dt.combinedCreditUsd.toFixed(2)}`));
-    L.push(linha('Valor em real', `R$ ${(dt.combinedCreditUsd * market.usdBrl).toFixed(2)}`));
-    L.push(linha('Valor em satoshis', `${dt.combinedCreditSats.toLocaleString('pt-BR')} sats`));
-    L.push(linha('Cotacao usada', `BTC = US$ ${market.btcUsd.toLocaleString('pt-BR')}`));
+    if (base.individualPeriods.length > 0) {
+      L.push('');
+      L.push(`  Maquinas paradas fora das quedas gerais (${base.individualPeriods.length}):`);
+      for (const x of base.individualPeriods) {
+        L.push(
+          `    ${x.label.padEnd(12)} ${dm(x.from)} -> ${hm(x.to)}  ` +
+            `${(x.soloMs / 3_600_000).toFixed(1).padStart(5)} h sozinha`,
+        );
+      }
+    }
+
+    const paradas = base.miners.filter((m) => m.downHours > 0.01);
+    if (paradas.length > 0) {
+      L.push('');
+      L.push('  Detalhe por maquina:');
+      L.push('    maquina        horas    contrato    credito');
+      for (const m of paradas) {
+        L.push(
+          `    ${m.label.padEnd(13)} ${m.downHours.toFixed(2).padStart(6)}   ` +
+            `US$ ${String(m.monthlyUsd).padStart(4)}   US$ ${m.creditUsd.toFixed(3).padStart(7)}`,
+        );
+      }
+    }
+
+    // Duas contagens diferentes, e confundi-las e o caminho mais curto para o
+    // host achar que o credito esta inflado: a queda geral e tempo de relogio,
+    // enquanto o credito se apura maquina a maquina — uma parada sozinha nao
+    // mexe na primeira e mexe na segunda.
+    const horasMaquina = base.totalDownHours;
+    const horasCobraveis = base.miners
+      .filter((m) => m.monthlyUsd > 0)
+      .reduce((a, m) => a + m.downHours, 0);
+
+    L.push(traco);
+    L.push(linha('Fazenda parada (relogio)', `${base.combinedOutageHours.toFixed(2)} h`));
+    L.push(linha('Horas-maquina paradas', `${horasMaquina.toFixed(2)} h`));
+    if (horasCobraveis < horasMaquina - 0.005) {
+      L.push(linha('  das quais cobraveis', `${horasCobraveis.toFixed(2)} h`));
+    }
+    L.push(linha('Credito apurado', `US$ ${creditoUsd.toFixed(2)}`));
+    L.push(linha('Em satoshis', emSats(creditoUsd)));
+    L.push('  Base: horas paradas de cada maquina x o custo por hora dela.');
+    if (horasCobraveis < horasMaquina - 0.005) {
+      L.push('  Maquina em cortesia nao gera credito: nada a abater.');
+    }
     L.push('');
-
-    if (bill.estimate) {
-      L.push('CUSTO DO MES');
-      L.push(linha('Acumulado ate agora', `US$ ${bill.estimate.usd.toFixed(2)}`));
-      L.push(linha('Projecao do mes fechado', `US$ ${bill.estimate.fullMonthUsd.toFixed(2)}`));
-      L.push(
-        linha('A pagar apos o credito', `US$ ${(bill.estimate.fullMonthUsd - dt.combinedCreditUsd).toFixed(2)}`),
-      );
-      L.push('');
-    }
   } else {
-    L.push('RESUMO DA COMPETENCIA');
-    L.push(linha('Energia paga', bill.satsPaid > 0 ? `${bill.satsPaid.toLocaleString('pt-BR')} sats` : 'nao lancada'));
-    if (bill.paidAt) L.push(linha('Pago em', dm(bill.paidAt)));
-    L.push(linha('Minerado no mes', `${bill.minedSats.toLocaleString('pt-BR')} sats`));
-    L.push(linha('Fonte do minerado', FONTE[bill.minedSource].label));
-    if (bill.burnPct !== null) L.push(linha('Producao consumida', `${bill.burnPct.toFixed(1)} %`));
-    if (bill.satsPaid > 0 && bill.minedSats > 0) {
-      L.push(linha('Sobra', `${bill.netSats.toLocaleString('pt-BR')} sats`));
+    L.push('CREDITO DE INDISPONIBILIDADE');
+    L.push(
+      mesBase
+        ? `  Sem medicao para ${mesBase}: o coletor nao estava em operacao.`
+        : '  Sem competencia anterior medida.',
+    );
+    L.push('');
+  }
+
+  // ------------------------------------------------------------- a pagar
+  L.push(traco);
+  L.push(linha(`CONTRATO DE ${mes.toUpperCase()}`, `US$ ${contratoMes.toFixed(2)}`));
+  if (creditoUsd > 0) L.push(linha(`(-) credito de ${mesBase}`, `US$ ${creditoUsd.toFixed(2)}`));
+  L.push(linha('A PAGAR', `US$ ${aPagarUsd.toFixed(2)}`));
+  L.push(linha('Em real', `R$ ${(aPagarUsd * market.usdBrl).toFixed(2)}`));
+  L.push(linha('Em satoshis', emSats(aPagarUsd)));
+  L.push(linha('Cotacao usada', `BTC = US$ ${Math.round(market.btcUsd).toLocaleString('pt-BR')}`));
+  L.push('');
+
+  // ---------------------------------------------------------- liquidacao
+  if (bill.hasRecord || bill.satsPaid > 0 || bill.creditGrantedUsd > 0) {
+    L.push('LIQUIDACAO');
+    if (bill.invoiceUsd !== null) L.push(linha('Faturado pelo host', `US$ ${bill.invoiceUsd.toFixed(2)}`));
+    if (bill.creditGrantedUsd > 0) {
+      L.push(linha('Credito concedido', `US$ ${bill.creditGrantedUsd.toFixed(2)}`));
+      const dif = bill.creditGrantedUsd - creditoUsd;
+      if (Math.abs(dif) > 0.005) {
+        L.push(linha('Diferenca do medido', `US$ ${dif.toFixed(2)} ${dif > 0 ? 'a mais' : 'a menos'}`));
+      }
+    }
+    if (bill.satsPaid > 0) {
+      L.push(linha('Pago', `${bill.satsPaid.toLocaleString('pt-BR')} sats`));
+      if (bill.paidAt) L.push(linha('Pago em', dm(bill.paidAt)));
     }
     if (bill.note) L.push(linha('Observacao', bill.note));
     L.push('');
-    L.push('  Sem medicao de indisponibilidade para esta competencia:');
-    L.push('  o coletor ainda nao estava em operacao no periodo.');
+  }
+
+  // ------------------------------------- desempenho, sempre em separado
+  const lf = base?.lowFleet;
+  if (lf && lf.hours > 0.05 && mesBase) {
+    L.push(regua);
+    L.push(' ADICIONAL PARA NEGOCIACAO - DESEMPENHO DA FAZENDA');
+    L.push(regua);
+    L.push('');
+    L.push(`  Tempo com a fazenda inteira produzindo abaixo de ${lf.thresholdPct}%`);
+    L.push(`  do hashrate nominal contratado, em ${mesBase}:`);
+    L.push('');
+    L.push(linha('Tempo abaixo da faixa', `${lf.hours.toFixed(2)} h`));
+    L.push(linha('Producao nao entregue', `${lf.lostEquivHours.toFixed(2)} h-maquina`));
+    L.push(linha('Equivalente em dolar', `US$ ${lf.suggestedUsd.toFixed(2)}`));
+    L.push(linha('Em real', `R$ ${(lf.suggestedUsd * market.usdBrl).toFixed(2)}`));
+    L.push(linha('Em satoshis', emSats(lf.suggestedUsd)));
+
+    if (lf.events.length > 0) {
+      L.push('');
+      L.push(`  Episodios (${lf.events.length}):`);
+      for (const e of lf.events.slice(-12)) {
+        L.push(
+          `    ${dm(e.from)} -> ${hm(e.to)}  ${String(Math.round(e.belowMs / 60000)).padStart(4)} min abaixo, ` +
+            `minimo ${e.minPct.toFixed(0)}%`,
+        );
+      }
+      if (lf.events.length > 12) L.push(`    (mostrando os 12 mais recentes de ${lf.events.length})`);
+    }
+
+    if (lf.byWorker.length > 0) {
+      L.push('');
+      L.push('  Por maquina, o que deixou de ser entregue:');
+      L.push('    maquina        h-maquina    equivalente');
+      for (const w of lf.byWorker.slice(0, 12)) {
+        L.push(
+          `    ${w.label.padEnd(13)} ${w.lostEquivHours.toFixed(2).padStart(7)}    US$ ${w.usd.toFixed(2).padStart(7)}`,
+        );
+      }
+    }
+
+    L.push('');
+    const liquido = Math.max(0, aPagarUsd - lf.suggestedUsd);
+    L.push(linha('A pagar se aceito', `US$ ${liquido.toFixed(2)}`));
+    L.push(linha('Em real', `R$ ${(liquido * market.usdBrl).toFixed(2)}`));
+    L.push(linha('Em satoshis', emSats(liquido)));
+    L.push('');
+    L.push('  Este item nao esta somado ao total acima.');
+    L.push('  A maquina degradada consumiu a energia quase toda, entao isto');
+    L.push('  nao e devolucao de consumo como no caso da parada: e a parte');
+    L.push('  do servico contratado que nao foi entregue. Fica registrado');
+    L.push('  com data e medicao para conversarmos com numero, e nao com');
+    L.push('  impressao.');
+    L.push('');
+    L.push('  As janelas de queda total estao fora desta conta: aquelas horas');
+    L.push('  ja entram no credito acima, e maquina parada nao conta como');
+    L.push('  entrega parcial. Nada aqui e cobrado duas vezes.');
     L.push('');
   }
+
+  // O que esta correndo nesta competencia nao entra aqui: e assunto da
+  // previa do mes seguinte, que ja o apresenta como desconto.
 
   L.push('Fonte dos dados: ViaBTC Pool API.');
   L.push('Quedas medidas pelo intervalo entre shares de cada maquina.');
   L.push(regua);
   return L.join('\n');
 }
+
 
 /**
  * Recibo de pagamento para enviar ao cobrador.
@@ -418,6 +597,12 @@ interface Previa {
   creditPartial: boolean;
   netUsd: number;
   netSats: number;
+  lowFleetHours: number;
+  lowFleetPct: number;
+  lowFleetUsd: number;
+  lowFleetSats: number;
+  netComDesempenhoUsd: number;
+  netComDesempenhoSats: number;
 }
 
 /**
@@ -437,6 +622,9 @@ function montarPrevia(
   const dia = (t: number) => new Date(t).toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' });
   const hhmm = (t: number) =>
     new Date(t).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+  /** Sats na cotacao deste instante, nao na de quando o payload foi montado. */
+  const emSats = (usd: number) =>
+    `${(market.btcUsd > 0 ? Math.round((usd / market.btcUsd) * 1e8) : 0).toLocaleString('pt-BR')} sats`;
 
   L.push(regua);
   L.push(' PREVIA DE COBRANCA - ENERGIA');
@@ -462,6 +650,10 @@ function montarPrevia(
   L.push('');
 
   L.push(`CREDITO DE INDISPONIBILIDADE - ${mesLabel(p.creditFrom).toUpperCase()}`);
+  const horasMaquina = dt ? dt.miners.reduce((a, m) => a + m.downHours, 0) : 0;
+  const horasCobraveis = dt
+    ? dt.miners.filter((m) => m.monthlyUsd > 0).reduce((a, m) => a + m.downHours, 0)
+    : 0;
   const eventos = dt
     ? [...dt.importedPeriods, ...dt.measuredPeriods].sort((a, b) => a.from - b.from)
     : [];
@@ -482,9 +674,22 @@ function montarPrevia(
       }
     }
     L.push(traco);
-    L.push(linha('Total parado', `${p.outageHours.toFixed(2)} h`, 28));
+    // Duas contagens diferentes, e confundi-las e o caminho mais curto para o
+    // host achar que o credito esta inflado: a queda geral e tempo de relogio,
+    // enquanto o credito se apura maquina a maquina — uma parada sozinha nao
+    // mexe na primeira e mexe na segunda.
+    L.push(linha('Fazenda parada (relogio)', `${p.outageHours.toFixed(2)} h`, 28));
+    L.push(linha('Horas-maquina paradas', `${horasMaquina.toFixed(2)} h`, 28));
+    if (horasCobraveis < horasMaquina - 0.005) {
+      L.push(linha('  das quais cobraveis', `${horasCobraveis.toFixed(2)} h`, 28));
+    }
   }
   L.push(linha('Credito apurado', `US$ ${p.creditUsd.toFixed(2)}`, 28));
+  L.push(linha('Em satoshis', emSats(p.creditUsd), 28));
+  L.push('  Base: horas paradas de cada maquina x o custo por hora dela.');
+  if (horasCobraveis < horasMaquina - 0.005) {
+    L.push('  Maquina em cortesia nao gera credito: nada a abater.');
+  }
   if (p.creditPartial) {
     L.push('');
     L.push(`  Apurado ate ${dm(Date.now())}. ${mesLabel(p.creditFrom)} ainda esta`);
@@ -495,12 +700,79 @@ function montarPrevia(
   L.push(traco);
   L.push(linha('A PAGAR', `US$ ${p.netUsd.toFixed(2)}`, 28));
   L.push(linha('Em real', `R$ ${(p.netUsd * market.usdBrl).toFixed(2)}`, 28));
-  L.push(linha('Em satoshis', `${p.netSats.toLocaleString('pt-BR')} sats`, 28));
+  L.push(linha('Em satoshis', emSats(p.netUsd), 28));
   L.push(linha('Cotacao usada', `BTC = US$ ${Math.round(market.btcUsd).toLocaleString('pt-BR')}`, 28));
   L.push('');
   L.push('  Favor emitir a cobranca ja considerando o credito acima.');
   L.push('  O valor em satoshis vale para a cotacao do momento; na hora');
   L.push('  do pagamento eu refaco a conversao.');
+
+  // Vem depois do total de proposito: e proposta, nao apuracao. O credito de
+  // parada se defende sozinho com a medicao; misturar os dois no mesmo
+  // subtotal daria ao host um motivo para contestar o conjunto.
+  if (p.lowFleetHours > 0.05 && dt) {
+    L.push('');
+    L.push(regua);
+    L.push(' ADICIONAL PARA NEGOCIACAO - DESEMPENHO DA FAZENDA');
+    L.push(regua);
+    L.push('');
+    L.push(`  Tempo com a fazenda inteira produzindo abaixo de ${p.lowFleetPct}%`);
+    L.push(`  do hashrate nominal contratado, em ${mesLabel(p.creditFrom)}:`);
+    L.push('');
+    L.push(linha('Tempo abaixo da faixa', `${p.lowFleetHours.toFixed(2)} h`, 28));
+    L.push(
+      linha('Producao nao entregue', `${dt.lowFleet.lostEquivHours.toFixed(2)} h-maquina`, 28),
+    );
+    L.push(linha('Equivalente em dolar', `US$ ${p.lowFleetUsd.toFixed(2)}`, 28));
+    if (market.usdBrl > 0) {
+      L.push(linha('Em real', `R$ ${(p.lowFleetUsd * market.usdBrl).toFixed(2)}`, 28));
+    }
+    L.push(linha('Em satoshis', emSats(p.lowFleetUsd), 28));
+
+    if (dt.lowFleet.events.length > 0) {
+      L.push('');
+      L.push(`  Episodios (${dt.lowFleet.events.length}):`);
+      for (const e of dt.lowFleet.events.slice(-12)) {
+        L.push(
+          `    ${hhmm(e.from)} -> ${new Date(e.to).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}` +
+            `  ${String(Math.round(e.belowMs / 60000)).padStart(4)} min abaixo, minimo ${e.minPct.toFixed(0)}%`,
+        );
+      }
+      if (dt.lowFleet.events.length > 12) {
+        L.push(`    (mostrando os 12 mais recentes de ${dt.lowFleet.events.length})`);
+      }
+    }
+
+    if (dt.lowFleet.byWorker.length > 0) {
+      L.push('');
+      L.push('  Por maquina, o que deixou de ser entregue:');
+      L.push('    maquina        h-maquina    equivalente');
+      for (const w of dt.lowFleet.byWorker.slice(0, 12)) {
+        L.push(
+          `    ${w.label.padEnd(13)} ${w.lostEquivHours.toFixed(2).padStart(7)}    US$ ${w.usd.toFixed(2).padStart(7)}`,
+        );
+      }
+    }
+
+    L.push('');
+    L.push(linha('A pagar se aceito', `US$ ${p.netComDesempenhoUsd.toFixed(2)}`, 28));
+    if (market.usdBrl > 0) {
+      L.push(linha('Em real', `R$ ${(p.netComDesempenhoUsd * market.usdBrl).toFixed(2)}`, 28));
+    }
+    L.push(linha('Em satoshis', emSats(p.netComDesempenhoUsd), 28));
+    L.push('');
+    L.push('  Este item nao esta somado ao total acima.');
+    L.push('  A maquina degradada consumiu a energia quase toda, entao isto');
+    L.push('  nao e devolucao de consumo como no caso da parada: e a parte');
+    L.push('  do servico contratado que nao foi entregue. Fica registrado');
+    L.push('  com data e medicao para conversarmos com numero, e nao com');
+    L.push('  impressao.');
+    L.push('');
+    L.push('  As janelas de queda total estao fora desta conta: aquelas horas');
+    L.push('  ja entram no credito acima, e maquina parada nao conta como');
+    L.push('  entrega parcial. Nada aqui e cobrado duas vezes.');
+  }
+
   L.push(regua);
   return L.join('\n');
 }
@@ -524,6 +796,8 @@ export function EnergyBills({
   const [msg, setMsg] = useState('');
   /** o detalhe por maquina sao 16 linhas: fica recolhido por padrao */
   const [verDetalhe, setVerDetalhe] = useState(false);
+  /** a lista de paradas individuais cresce o mes inteiro: idem */
+  const [verIndividuais, setVerIndividuais] = useState(false);
   /** competencia com extrato aberto */
   const [extratoMes, setExtratoMes] = useState<string | null>(null);
   const [copiado, setCopiado] = useState(false);
@@ -562,21 +836,33 @@ export function EnergyBills({
 
   const dt: DowntimeReport | null = data?.downtime ?? null;
   const paradas = dt ? dt.miners.filter((m) => m.downHours > 0.01) : [];
+  // O que a lista recolhida precisa mostrar sem ser aberta: o que ainda
+  // esta acontecendo, e o tamanho do prejuizo acumulado.
+  const individuaisEmCurso = dt
+    ? dt.individualPeriods.filter((x) => x.to >= dt.until - 5 * 60_000).length
+    : 0;
+  const horasSozinhas = dt ? dt.individualPeriods.reduce((a, x) => a + x.soloMs, 0) / 3_600_000 : 0;
 
   const billExtrato = bills.find((b) => b.month === extratoMes) ?? null;
+  /** A competencia anterior sustenta o desconto: a energia e paga adiantada. */
+  const billAnterior = billExtrato
+    ? (bills.find((b) => proximoMes(b.month) === billExtrato.month) ?? null)
+    : null;
   const textoExtrato =
     billExtrato && market
-      ? montarExtrato(billExtrato, market, data?.contractedUsdMonth ?? 0, account || 'nao informada')
+      ? montarExtrato(
+          billExtrato,
+          billAnterior,
+          market,
+          data?.contractedUsdMonth ?? 0,
+          account || 'nao informada',
+        )
       : '';
 
   const copiar = async () => {
-    try {
-      await navigator.clipboard.writeText(textoExtrato);
-      setCopiado(true);
-      setTimeout(() => setCopiado(false), 2500);
-    } catch {
-      setCopiado(false);
-    }
+    const ok = await copiarTexto(textoExtrato);
+    setCopiado(ok);
+    if (ok) setTimeout(() => setCopiado(false), 2500);
   };
 
   const limpar = () => {
@@ -635,13 +921,9 @@ export function EnergyBills({
 
   const copiarRecibo = async () => {
     if (!recibo) return;
-    try {
-      await navigator.clipboard.writeText(recibo);
-      setReciboCopiado(true);
-      setTimeout(() => setReciboCopiado(false), 2500);
-    } catch {
-      setReciboCopiado(false);
-    }
+    const ok = await copiarTexto(recibo);
+    setReciboCopiado(ok);
+    if (ok) setTimeout(() => setReciboCopiado(false), 2500);
   };
 
   const submit = async (e: React.FormEvent) => {
@@ -731,7 +1013,7 @@ export function EnergyBills({
                 className="term-btn !py-[2px] !px-3 !text-[0.62rem]"
                 onClick={async () => {
                   try {
-                    await navigator.clipboard.writeText(previaDoc);
+                    await copiarTexto(previaDoc);
                     setPreviaCopiada(true);
                     setTimeout(() => setPreviaCopiada(false), 2500);
                   } catch {
@@ -849,10 +1131,27 @@ export function EnergyBills({
               {/* Maquina parada fora da queda geral: some no meio da tabela */}
               {dt.individualPeriods.length > 0 && (
                 <div className="mb-3 border border-crit/50 p-2">
-                  <span className="panel-title text-crit">
-                    Paradas individuais ({dt.individualPeriods.length}) — fora das quedas gerais
-                  </span>
-                  <ul className="mt-1 space-y-0.5 text-[0.68rem]">
+                  <button
+                    className="flex w-full flex-wrap items-baseline gap-x-2 text-left"
+                    onClick={() => setVerIndividuais(!verIndividuais)}
+                    aria-expanded={verIndividuais}
+                  >
+                    <span className="panel-title text-crit">
+                      {verIndividuais ? '▼' : '▶'} Paradas individuais ({dt.individualPeriods.length}) — fora das
+                      quedas gerais
+                    </span>
+                    {individuaisEmCurso > 0 && (
+                      <span className="blink-crit text-[0.6rem] text-crit">{individuaisEmCurso} em curso</span>
+                    )}
+                    <span className="ml-auto text-[0.6rem] dimmer">
+                      {horasSozinhas.toFixed(1)}h sozinhas no total
+                    </span>
+                  </button>
+                  <ul
+                    className={`mt-1 max-h-56 space-y-0.5 overflow-y-auto pr-1 text-[0.68rem] ${
+                      verIndividuais ? '' : 'hidden'
+                    }`}
+                  >
                     {dt.individualPeriods.map((p) => {
                       const emCursoAgora = p.to >= dt.until - 5 * 60_000;
                       return (
@@ -918,6 +1217,48 @@ export function EnergyBills({
                 </div>
               )}
 
+              {dt.lowFleet.hours > 0.05 && (
+                <div className="mb-3 border border-warn/40 p-2">
+                  <div className="flex flex-wrap items-baseline justify-between gap-2">
+                    <span className="panel-title text-warn">
+                      Fazenda abaixo de {dt.lowFleet.thresholdPct}% do nominal
+                    </span>
+                    <span className="text-[0.6rem] dimmer">adicional para negociacao · fora do credito</span>
+                  </div>
+                  <div className="mt-2 grid grid-cols-2 gap-3 lg:grid-cols-4">
+                    <Stat
+                      label="Tempo abaixo da faixa"
+                      value={`${dt.lowFleet.hours.toFixed(2)} h`}
+                      sub={`${dt.lowFleet.events.length} episodio(s) na competencia`}
+                      hint="Tempo de relogio com a fazenda inteira produzindo abaixo do limite"
+                      tone="warn"
+                    />
+                    <Stat
+                      label="Producao nao entregue"
+                      value={`${dt.lowFleet.lostEquivHours.toFixed(2)} h`}
+                      sub="horas-maquina equivalentes"
+                      hint="O que faltou para o nominal, convertido em horas de maquina parada. So conta maquina ligada: a parada ja entra no credito"
+                    />
+                    <Stat
+                      label="Equivalente sugerido"
+                      value={fmtUsd(dt.lowFleet.suggestedUsd)}
+                      sub={`≈ ${fmtNum(dt.lowFleet.suggestedSats)} sats`}
+                      tone="warn"
+                    />
+                    <Stat
+                      label="Maquinas envolvidas"
+                      value={`${dt.lowFleet.byWorker.length}`}
+                      sub="entregaram menos que o nominal"
+                    />
+                  </div>
+                  <p className="mt-2 text-[0.62rem] dimmer">
+                    Maquina degradada consome a energia quase toda, entao isto nao e devolucao de consumo como a
+                    parada — e a parte do servico que nao foi entregue. Entra na previa do mes seguinte como item
+                    separado, com data e medicao.
+                  </p>
+                </div>
+              )}
+
               {paradas.length === 0 && dt.importedPeriods.length === 0 ? (
                 <p className="text-[0.68rem] dim">
                   Nenhuma parada registrada na janela observada — sem desconto a reivindicar.
@@ -934,7 +1275,7 @@ export function EnergyBills({
                     <Stat
                       label="Horas-maquina paradas"
                       value={`${dt.totalDownHours.toFixed(2)}`}
-                      sub="soma das 16 · base do rateio"
+                      sub={`soma das ${dt.miners.length} · base do rateio`}
                       hint="Soma das horas paradas de todas as maquinas — nao e tempo de relogio"
                     />
                     <Stat
@@ -1027,7 +1368,7 @@ export function EnergyBills({
                             className="term-btn !py-[2px] !px-3 !text-[0.62rem]"
                             onClick={async () => {
                               try {
-                                await navigator.clipboard.writeText(relatorio);
+                                await copiarTexto(relatorio);
                                 setRelatorioCopiado(true);
                                 setTimeout(() => setRelatorioCopiado(false), 2500);
                               } catch {
@@ -1342,20 +1683,25 @@ export function EnergyBills({
                       {b.creditGrantedSats > 0 ? (
                         <div className="text-warn">
                           concedeu {fmtNum(b.creditGrantedSats)}
-                          {b.creditEarnedSats > 0 && (
-                            <span className="ml-1 text-[0.6rem] dimmer">
-                              {b.creditGrantedSats >= b.creditEarnedSats ? '≥' : '<'} medido
-                            </span>
-                          )}
+                          <span className="ml-1 text-[0.6rem] dimmer">
+                            {b.creditEarnedSats > 0
+                              ? `${b.creditGrantedSats >= b.creditEarnedSats ? '≥' : '<'} medido · abate em ${mesLabel(proximoMes(b.month))}`
+                              : `abate em ${mesLabel(proximoMes(b.month))}`}
+                          </span>
                         </div>
                       ) : (
                         b.creditEarnedSats > 0 && (
-                          <div className="text-[0.6rem] dimmer">aguardando abatimento</div>
+                          <div
+                            className="text-[0.6rem] dimmer"
+                            title="A energia e paga adiantada: o que parou nesta competencia so e abatido na fatura do mes seguinte."
+                          >
+                            a abater em {mesLabel(proximoMes(b.month))}, aguardando o host
+                          </div>
                         )
                       )}
                       {b.creditAppliedSats > 0 && (
                         <div className="hot text-[0.66rem]">
-                          − {fmtNum(b.creditAppliedSats)}
+                          abatido aqui − {fmtNum(b.creditAppliedSats)}
                           <span className="ml-1 dimmer">
                             de {b.creditAppliedMonth ? mesLabel(b.creditAppliedMonth) : 'outra comp.'}
                           </span>
@@ -1494,6 +1840,10 @@ export function EnergyBills({
 
       <div className="mt-3 space-y-1 border-t border-phos/15 pt-2 text-[0.62rem] dimmer">
         <p>
+          A energia e paga adiantada, entao o que parou numa competencia so e abatido na fatura da seguinte: a linha{' '}
+          <span className="hot">abatido aqui</span> veio do mes anterior, e a linha{' '}
+          <span className="dim">a abater</span> vai para o proximo. As duas convivem na mesma competencia sem se
+          anularem.{' '}
           O credito que <span className="dim">medimos</span> e apenas referencia para conferir a fatura — quem altera
           o custo da competencia e o que o cobrador de fato concedeu, informado no campo Abatido nesta fatura.
         </p>

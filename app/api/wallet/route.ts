@@ -8,7 +8,21 @@ import { num, viabtc } from '@/lib/viabtc';
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
 
-export async function GET() {
+/**
+ * Quantos registros devolver. O padrao continua o de sempre (90 dias, 60
+ * pagamentos), mas quem guarda historico proprio — o btc-ops — precisa pedir
+ * mais: o banco daqui tem tudo, e so o corte da resposta fazia pagamentos
+ * antigos sumirem para o consumidor.
+ */
+function limitParam(url: URL, name: string, fallback: number, max: number): number {
+  const raw = Number(url.searchParams.get(name));
+  return Number.isInteger(raw) && raw > 0 ? Math.min(raw, max) : fallback;
+}
+
+export async function GET(req: Request) {
+  const url = new URL(req.url);
+  const daysLimit = limitParam(url, 'days', 90, 3650);
+  const paymentsLimit = limitParam(url, 'payments', 60, 5000);
   try {
     const [account, summary, market] = await Promise.all([
       viabtc.account(),
@@ -17,7 +31,7 @@ export async function GET() {
     ]);
 
     // Se o banco ainda esta vazio, busca direto da pool.
-    let days = profitDays(90);
+    let days = profitDays(daysLimit);
     if (days.length === 0) {
       days = (await viabtc.profitHistory(90).catch(() => [])).map((p) => ({
         date: p.date,
@@ -27,7 +41,7 @@ export async function GET() {
         solo: num(p.solo_profit),
       }));
     }
-    let pays = payments(60);
+    let pays = payments(paymentsLimit);
     if (pays.length === 0) {
       pays = (await viabtc.paymentHistory(60).catch(() => [])).map((p) => ({
         id: p.id,

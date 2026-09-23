@@ -16,6 +16,20 @@ import {
   fmtPct,
   fmtSats,
 } from '@/lib/format';
+import type { MediaJanela } from '@/lib/types';
+
+/**
+ * Media de janela longa, com a cobertura declarada quando ela nao fecha.
+ *
+ * Uma media de 30 dias montada com 12 dias de coleta nao e uma media de 30
+ * dias, e mostrar so o numero convidaria a compara-la com o nominal de hoje
+ * como se fosse.
+ */
+function mediaLonga(m: MediaJanela | null, janelaDias: number): string {
+  if (!m) return 'coletando…';
+  const parcial = m.days < janelaDias * 0.9;
+  return parcial ? `${fmtHash(m.avg)} · ${m.days.toFixed(0)}d` : fmtHash(m.avg);
+}
 
 export default function Dashboard() {
   const { data, error, isLoading } = useOverview();
@@ -104,6 +118,8 @@ export default function Dashboard() {
                 k="Media 24h (local)"
                 v={t.hashrate24hLocal !== null ? fmtHash(t.hashrate24hLocal) : 'coletando…'}
               />
+              <KeyValue k="Media 7d" v={mediaLonga(t.hashrate7d, 7)} />
+              <KeyValue k="Media 30d" v={mediaLonga(t.hashrate30d, 30)} />
               <KeyValue k="Nominal" v={fmtHash(t.nominalTh)} />
               <div className="pt-2">
                 <div className="flex justify-between text-[0.68rem]">

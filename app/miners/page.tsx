@@ -6,10 +6,18 @@ import { FleetRankChart } from '@/components/Charts';
 import { MinerCard } from '@/components/MinerCard';
 import { Led, Meter, Panel, Sparkline, Stat } from '@/components/ui';
 import { useOverview } from '@/lib/client';
-import { fmtDuration, fmtHash, fmtMoney, fmtPct } from '@/lib/format';
-import type { MinerView } from '@/lib/types';
+import { fmtBrl, fmtDuration, fmtHash, fmtMoney, fmtPct } from '@/lib/format';
+import type { MinerView, PaybackInfo } from '@/lib/types';
 
-type SortKey = 'worker' | 'hashrate10m' | 'performance' | 'rejectPct' | 'health' | 'profitDayBrl' | 'efficiency';
+type SortKey =
+  | 'worker'
+  | 'hashrate10m'
+  | 'performance'
+  | 'rejectPct'
+  | 'health'
+  | 'profitDayBrl'
+  | 'efficiency'
+  | 'payback';
 
 const COLUMNS: { key: SortKey; label: string }[] = [
   { key: 'worker', label: 'Maquina' },
@@ -19,7 +27,20 @@ const COLUMNS: { key: SortKey; label: string }[] = [
   { key: 'rejectPct', label: 'Rejeicao' },
   { key: 'health', label: 'Saude' },
   { key: 'profitDayBrl', label: 'Lucro/dia' },
+  { key: 'payback', label: 'Payback' },
 ];
+
+/**
+ * Prazo em texto curto. Acima de dois anos o numero exato e ilusao de
+ * precisao: depende de dificuldade e preco, que ninguem projeta a esse prazo.
+ */
+function etaCurto(p: PaybackInfo): string {
+  if (p.done) return 'quitada';
+  if (p.daysLeft === null) return 'sem lucro';
+  if (p.daysLeft > 730) return '+2 anos';
+  if (p.daysLeft >= 60) return `~${Math.round(p.daysLeft / 30)} meses`;
+  return `~${Math.round(p.daysLeft)} dias`;
+}
 
 export default function MinersPage() {
   const { data, error } = useOverview();
@@ -40,6 +61,12 @@ export default function MinersPage() {
       );
     }
     return [...list].sort((a, b) => {
+      // Payback e objeto: ordena pelo percentual ja devolvido, e maquina sem
+      // preco informado vai para o fim em vez de virar NaN.
+      if (sort === 'payback') {
+        const cmp = (a.payback?.pct ?? -1) - (b.payback?.pct ?? -1);
+        return asc ? cmp : -cmp;
+      }
       const va = a[sort];
       const vb = b[sort];
       const cmp = typeof va === 'string' ? va.localeCompare(String(vb)) : Number(va) - Number(vb);
@@ -201,6 +228,31 @@ export default function MinersPage() {
                   </td>
                   <td className={(cur === 'BRL' ? m.profitDayBrl : m.profitDayUsd) < 0 ? 'text-crit' : ''}>
                     {fmtMoney(cur === 'BRL' ? m.profitDayBrl : m.profitDayUsd, cur, true)}
+                  </td>
+                  <td>
+                    {m.payback ? (
+                      <div
+                        className="flex items-center gap-2"
+                        title={
+                          `Retorno medido em ${m.payback.measuredDays} dia(s)` +
+                          (m.payback.from ? ` desde ${m.payback.from}` : '') +
+                          `: ${fmtBrl(m.payback.returnedBrl, true)} de ${fmtBrl(m.payback.purchaseBrl, true)}`
+                        }
+                      >
+                        <span className={m.payback.done ? 'hot' : ''}>{fmtPct(m.payback.pct, 0)}</span>
+                        <div className="w-16">
+                          <Meter
+                            ratio={Math.min(1, m.payback.pct / 100)}
+                            segments={10}
+                            height={6}
+                            tone={m.payback.done ? 'normal' : 'warn'}
+                          />
+                        </div>
+                        <span className="dimmer text-[0.65rem]">{etaCurto(m.payback)}</span>
+                      </div>
+                    ) : (
+                      <span className="dimmer">—</span>
+                    )}
                   </td>
                   <td>
                     <Sparkline points={m.sparkline} width={90} height={22} reference={m.nominalTh} />

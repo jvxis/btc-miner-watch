@@ -31,8 +31,10 @@ no fim deste documento. Este projeto contorna todas elas com um coletor local.
 - **P&L** por competência, em satoshis, com o preço efetivo da energia por kWh
 - **Cobrança adiantada**: prévia do mês seguinte já com o desconto das paradas
   do mês corrente, pronta para enviar ao fornecedor
-- **Avisos no Telegram** para máquina parada, fazenda parada, falha de contato
-  com a pool e degradação prolongada
+- **Payback por máquina**: preço pago, quanto já voltou em satoshis e a
+  previsão de quitação no ritmo atual
+- **Avisos no Telegram** em três níveis — crítico (máquina parada, fazenda
+  parada, falha na pool), degradação prolongada e problema crônico
 - **Simulador** de preço do BTC, tarifa e dificuldade
 - Três tons de fósforo: P4 branco, P3 âmbar, P1 verde
 
@@ -89,9 +91,21 @@ ligados; para silenciar, apague o chat id.
 Cada condição avisa uma vez quando começa e outra quando normaliza — repetir a
 cada leitura ensinaria o operador a ignorar o canal. Pelo mesmo motivo,
 condições que começam no mesmo ciclo vão numa mensagem só: uma queda geral não
-deve render uma notificação por máquina. Degradação só vira aviso depois de
-persistir além do limite configurado, porque oscilação de poucos minutos é ruído
-normal de minerador.
+deve render uma notificação por máquina.
+
+São três níveis, do mais urgente ao mais silencioso:
+
+| nível | dispara quando |
+|---|---|
+| crítico | máquina sem produzir, fazenda inteira parada, sem contato com a pool |
+| degradação | uma máquina abaixo do esperado **e** a fazenda abaixo do limite dela, ambos além do tempo configurado |
+| crônico | a média da janela (24h por padrão) abaixo do limite da fazenda, com alguma máquina degradada há o mesmo tempo |
+
+A degradação de uma máquina isolada não vira mensagem: uma unidade oscilando é
+rotina e fica no painel. O que interrompe alguém é o conjunto caindo. O aviso
+crônico existe porque os outros dois reagem a mudança — nenhum dispara quando a
+fazenda simplesmente vive abaixo do contratado por dias, que é o caso que mais
+custa dinheiro justamente por não acordar ninguém.
 
 ## Páginas
 
@@ -113,8 +127,9 @@ lib/viabtc.ts    cliente da ViaBTC, com assinatura HMAC e tradução de erros
 lib/db.ts        SQLite via node:sqlite, sem dependência externa
 lib/poller.ts    coletor de snapshots e detecção de quedas
 lib/metrics.ts   motor de cálculo: energia, receita, lucro, saúde, alertas
-lib/health.ts    critério único de degradação, compartilhado por coletor e tela
+lib/health.ts    critérios de parada e degradação, um só para coletor e tela
 lib/notify.ts    avisos no Telegram, com memória do que já foi avisado
+lib/payback.ts   retorno do investimento por máquina, rateado pelo hashrate
 lib/market.ts    preço (CoinGecko) e rede (mempool.space), com cache e fallback
 ```
 
@@ -139,6 +154,20 @@ zeros como queda geraria alarme falso e, num cálculo de crédito, valor indevid
 **`last_active` é republicado a cada ~5 minutos.** Medir parada comparando
 coletas de 1 minuto acusaria queda em 4 de cada 5 intervalos. A detecção usa o
 intervalo entre shares, com tolerância acima do período de republicação.
+
+**O `worker_status` vira `unactive` com ~10 minutos sem share**, mesmo com a
+máquina produzindo normalmente — intervalo de 10 minutos entre shares acontece.
+Usar esse campo como critério de parada gera enxurradas de alerta crítico com o
+hashrate intacto. Ele não entra na conta.
+
+**A cadência de publicação do `last_active` muda sem aviso.** O normal é a cada
+~5 minutos, mas já foi observada em 10 minutos por vários dias seguidos. Um
+limite de parada calibrado para a cadência antiga passa a ver a fazenda inteira
+"parada" nos minutos antes de cada atualização, e o mês enche de quedas de 1 a 2
+minutos que nunca existiram. Por isso **parada exige duas evidências**: o
+`last_active` diz *quando* a máquina parou de enviar share, e o hashrate diz
+*se* ela realmente parou. Ajustar o limite à cadência medida foi tentado e
+descartado — a pool volta a mudar, e o hashrate é a única verdade independente.
 
 **A média de 1 hora demora até 60 minutos para se limpar depois de uma queda.**
 Usá-la para status manteria a fazenda inteira marcada como degradada por quase

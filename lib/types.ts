@@ -86,6 +86,16 @@ export type MinerCostMode = CostMode | 'inherit';
 export interface MinerConfig {
   /** worker_name como aparece na pool */
   worker: string;
+  /** quanto a maquina custou, em BRL — base do payback */
+  purchaseBrl: number;
+  /**
+   * Quando esta maquina entrou em operacao.
+   *
+   * So importa antes de existir snapshot local: dai para tras o rateio da
+   * receita nao tem hashrate por maquina e divide entre as que ja estavam
+   * ligadas. Vazio significa "desde o inicio da operacao".
+   */
+  startedAt: number | null;
   /** apelido livre exibido na interface */
   label: string;
   /** hashrate nominal de fabrica, TH/s */
@@ -123,6 +133,15 @@ export interface Settings {
   primaryCurrency: 'BRL' | 'USD';
   /** limite de hashrate abaixo do nominal que dispara alerta, % */
   alertHashratePct: number;
+  /** abaixo deste % do nominal somado, a fazenda inteira conta como degradada */
+  alertFleetPct: number;
+  /**
+   * Janela do aviso de problema cronico, em horas.
+   *
+   * Vale para os dois lados da condicao: a media da fazenda nessa janela e
+   * ha quanto tempo a maquina precisa estar degradada para entrar na conta.
+   */
+  alertChronicHours: number;
   /** reject rate acima disso dispara alerta, % */
   alertRejectPct: number;
   /** minutos sem share que marcam a maquina como offline */
@@ -133,6 +152,8 @@ export interface Settings {
   fixedMonthlyCostBrl: number;
   /** eficiencia de referencia J/TH usada no assistente de configuracao */
   referenceJPerTh: number;
+  /** primeiro dia de mineracao da fazenda, para o payback alcancar o inicio */
+  miningStartedAt: number | null;
   /** avisa no Telegram: criticos e degradacao prolongada. Preencher = ligado */
   telegramToken: string;
   telegramChatId: string;
@@ -143,6 +164,26 @@ export interface Settings {
 
 /** `recovering`: ja voltou a produzir, mas a media de 1h ainda carrega a queda. */
 export type MinerStatus = 'online' | 'recovering' | 'degraded' | 'offline';
+
+export interface PaybackInfo {
+  purchaseBrl: number;
+  returnedBrl: number;
+  /** satoshis minerados por esta maquina no periodo — o que esta na carteira */
+  returnedSats: number;
+  /** energia acumulada em dolar, a moeda do contrato */
+  energyUsd: number;
+  pct: number;
+  measuredDays: number;
+  from: string | null;
+  /** dias em que o rateio usou hashrate real por maquina */
+  preciseDays: number;
+  /** dias em que a receita foi dividida entre as maquinas ligadas */
+  estimatedDays: number;
+  profitDayBrl: number;
+  daysLeft: number | null;
+  etaAt: number | null;
+  done: boolean;
+}
 
 export interface MinerView {
   workerId: number;
@@ -190,6 +231,8 @@ export interface MinerView {
   degradedSince: number | null;
   /** desvio percentual frente a mediana da fazenda */
   vsFleetPct: number;
+  /** retorno do investimento; null quando a maquina nao tem preco informado */
+  payback: PaybackInfo | null;
   sparkline: { t: number; h: number }[];
   onlineTime7d: string | null;
   onlineTime30d: string | null;
@@ -229,12 +272,23 @@ export interface MarketData {
   stale: boolean;
 }
 
+/** Media de uma janela longa, com a cobertura real que a sustenta. */
+export interface MediaJanela {
+  avg: number;
+  /** dias efetivamente coletados dentro da janela */
+  days: number;
+}
+
 export interface FleetTotals {
   hashrate10m: number;
   hashrate1h: number;
   /** soma das medianas recentes — reage em minutos, nao em 1 hora */
   hashrateRef: number;
   hashrate24hLocal: number | null;
+  /** media de 7 dias do hashrate da conta */
+  hashrate7d: MediaJanela | null;
+  /** media de 30 dias do hashrate da conta */
+  hashrate30d: MediaJanela | null;
   nominalTh: number;
   performance: number;
   activeWorkers: number;

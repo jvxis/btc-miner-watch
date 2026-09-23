@@ -8,8 +8,8 @@ import type { Settings } from './types';
  * cada condicao avisa uma vez so, quando comeca, e avisa de novo quando
  * termina — sem o aviso de fim nao da para saber se o problema continua sem
  * abrir o painel; e quando muita coisa cai junto, tudo vai numa mensagem so,
- * porque uma queda geral disparando dezoito notificacoes ensina o dono a
- * silenciar o bot.
+ * porque uma queda geral disparando uma notificacao por maquina ensina o
+ * dono a silenciar o bot.
  */
 
 export interface Aviso {
@@ -54,6 +54,11 @@ function abertos(): Map<string, { texto_fim: string | null }> {
     .prepare('SELECT alert_id, texto_fim FROM notifications WHERE cleared_at IS NULL')
     .all() as { alert_id: string; texto_fim: string | null }[];
   return new Map(rows.map((r) => [r.alert_id, { texto_fim: r.texto_fim }]));
+}
+
+/** Ids de condicoes ainda abertas, para quem precisa decidir se reabre ou nao. */
+export function avisosAbertos(): Set<string> {
+  return new Set(abertos().keys());
 }
 
 /** O Telegram corta em 4096 caracteres; sobra folga para o cabecalho. */
