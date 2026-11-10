@@ -1,7 +1,7 @@
 'use client';
 
 import { useState } from 'react';
-import { Meter, Panel, Stat } from '@/components/ui';
+import { KeyValue, Meter, Panel, Stat } from '@/components/ui';
 import { useEnergyBills } from '@/lib/client';
 import { fmtDate, fmtMoney, fmtNum, fmtPct, fmtUsd } from '@/lib/format';
 
@@ -43,6 +43,18 @@ interface DowntimeReport {
   combinedCreditUsd: number;
   combinedCreditSats: number;
   lowFleet: LowFleet;
+  producaoPerdida: ProducaoPerdida | null;
+}
+
+/** Satoshis que deixaram de ser minerados — receita, nao custo de energia. */
+interface ProducaoPerdida {
+  faltouThh: number;
+  satsPorThh: number;
+  diasRendimento: number;
+  totalSats: number;
+  paradasSats: number;
+  desempenhoSats: number;
+  abatimentoSats: number;
 }
 
 /** Fazenda produzindo abaixo da faixa: perda de entrega, nao de energia. */
@@ -193,6 +205,7 @@ function montarExtrato(
   market: { btcUsd: number; btcBrl: number; usdBrl: number },
   contratoUsd: number,
   conta: string,
+  fatiaDesempenhoPct: number,
 ): string {
   const L: string[] = [];
   const regua = '='.repeat(56);
@@ -353,7 +366,7 @@ function montarExtrato(
   const lf = base?.lowFleet;
   if (lf && lf.hours > 0.05 && mesBase) {
     L.push(regua);
-    L.push(' ADICIONAL PARA NEGOCIACAO - DESEMPENHO DA FAZENDA');
+    L.push(` DESEMPENHO DA FAZENDA - RATEIO DE ${fatiaDesempenhoPct}% CONFORME ACORDADO`);
     L.push(regua);
     L.push('');
     L.push(`  Tempo com a fazenda inteira produzindo abaixo de ${lf.thresholdPct}%`);
@@ -389,17 +402,28 @@ function montarExtrato(
     }
 
     L.push('');
-    const liquido = Math.max(0, aPagarUsd - lf.suggestedUsd);
-    L.push(linha('A pagar se aceito', `US$ ${liquido.toFixed(2)}`));
+    const fatia = Math.min(100, Math.max(0, fatiaDesempenhoPct)) / 100;
+    const rateio = lf.suggestedUsd * fatia;
+    const liquido = Math.max(0, aPagarUsd - rateio);
+    L.push(traco);
+    L.push(linha(`Rateio acordado (${fatiaDesempenhoPct}%)`, `US$ ${rateio.toFixed(2)}`));
+    L.push(linha('Em real', `R$ ${(rateio * market.usdBrl).toFixed(2)}`));
+    L.push(linha('Em satoshis', emSats(rateio)));
+    L.push('');
+    L.push(traco);
+    L.push(linha('A PAGAR COM O RATEIO', `US$ ${liquido.toFixed(2)}`));
     L.push(linha('Em real', `R$ ${(liquido * market.usdBrl).toFixed(2)}`));
     L.push(linha('Em satoshis', emSats(liquido)));
     L.push('');
-    L.push('  Este item nao esta somado ao total acima.');
     L.push('  A maquina degradada consumiu a energia quase toda, entao isto');
     L.push('  nao e devolucao de consumo como no caso da parada: e a parte');
-    L.push('  do servico contratado que nao foi entregue. Fica registrado');
-    L.push('  com data e medicao para conversarmos com numero, e nao com');
-    L.push('  impressao.');
+    L.push('  do servico contratado que nao foi entregue. Como a causa pode');
+    L.push('  estar dos dois lados, a perda entra pela fatia combinada.');
+    L.push('');
+    L.push('  Fica em linha separada de proposito: o credito de parada e');
+    L.push('  aritmetica de consumo que nao houve e nao se discute, enquanto');
+    L.push('  este item e acordo. Somados, uma duvida sobre o segundo');
+    L.push('  contaminaria o primeiro.');
     L.push('');
     L.push('  As janelas de queda total estao fora desta conta: aquelas horas');
     L.push('  ja entram no credito acima, e maquina parada nao conta como');
@@ -410,7 +434,7 @@ function montarExtrato(
   // O que esta correndo nesta competencia nao entra aqui: e assunto da
   // previa do mes seguinte, que ja o apresenta como desconto.
 
-  L.push('Fonte dos dados: ViaBTC Pool API.');
+  L.push('Fonte dos dados: API da pool de mineracao e coletor proprio.');
   L.push('Quedas medidas pelo intervalo entre shares de cada maquina.');
   L.push(regua);
   return L.join('\n');
@@ -600,6 +624,8 @@ interface Previa {
   lowFleetHours: number;
   lowFleetPct: number;
   lowFleetUsd: number;
+  lowFleetSharePct: number;
+  lowFleetShareUsd: number;
   lowFleetSats: number;
   netComDesempenhoUsd: number;
   netComDesempenhoSats: number;
@@ -713,7 +739,7 @@ function montarPrevia(
   if (p.lowFleetHours > 0.05 && dt) {
     L.push('');
     L.push(regua);
-    L.push(' ADICIONAL PARA NEGOCIACAO - DESEMPENHO DA FAZENDA');
+    L.push(` DESEMPENHO DA FAZENDA - RATEIO DE ${p.lowFleetSharePct}% CONFORME ACORDADO`);
     L.push(regua);
     L.push('');
     L.push(`  Tempo com a fazenda inteira produzindo abaixo de ${p.lowFleetPct}%`);
@@ -754,19 +780,29 @@ function montarPrevia(
       }
     }
 
+    L.push(traco);
+    L.push(linha(`Rateio acordado (${p.lowFleetSharePct}%)`, `US$ ${p.lowFleetShareUsd.toFixed(2)}`, 28));
+    if (market.usdBrl > 0) {
+      L.push(linha('Em real', `R$ ${(p.lowFleetShareUsd * market.usdBrl).toFixed(2)}`, 28));
+    }
+    L.push(linha('Em satoshis', emSats(p.lowFleetShareUsd), 28));
     L.push('');
-    L.push(linha('A pagar se aceito', `US$ ${p.netComDesempenhoUsd.toFixed(2)}`, 28));
+    L.push(traco);
+    L.push(linha('A PAGAR COM O RATEIO', `US$ ${p.netComDesempenhoUsd.toFixed(2)}`, 28));
     if (market.usdBrl > 0) {
       L.push(linha('Em real', `R$ ${(p.netComDesempenhoUsd * market.usdBrl).toFixed(2)}`, 28));
     }
     L.push(linha('Em satoshis', emSats(p.netComDesempenhoUsd), 28));
     L.push('');
-    L.push('  Este item nao esta somado ao total acima.');
     L.push('  A maquina degradada consumiu a energia quase toda, entao isto');
     L.push('  nao e devolucao de consumo como no caso da parada: e a parte');
-    L.push('  do servico contratado que nao foi entregue. Fica registrado');
-    L.push('  com data e medicao para conversarmos com numero, e nao com');
-    L.push('  impressao.');
+    L.push('  do servico contratado que nao foi entregue. Como a causa pode');
+    L.push('  estar dos dois lados, a perda entra pela fatia combinada.');
+    L.push('');
+    L.push('  Fica em linha separada de proposito: o credito de parada e');
+    L.push('  aritmetica de consumo que nao houve e nao se discute, enquanto');
+    L.push('  este item e acordo. Somados, uma duvida sobre o segundo');
+    L.push('  contaminaria o primeiro.');
     L.push('');
     L.push('  As janelas de queda total estao fora desta conta: aquelas horas');
     L.push('  ja entram no credito acima, e maquina parada nao conta como');
@@ -836,6 +872,8 @@ export function EnergyBills({
 
   const dt: DowntimeReport | null = data?.downtime ?? null;
   const paradas = dt ? dt.miners.filter((m) => m.downHours > 0.01) : [];
+  /** fatia da perda por desempenho que foi acordada com o host, em % */
+  const fatiaDesempenho = data?.performanceSplitPct ?? 50;
   // O que a lista recolhida precisa mostrar sem ser aberta: o que ainda
   // esta acontecendo, e o tamanho do prejuizo acumulado.
   const individuaisEmCurso = dt
@@ -856,6 +894,7 @@ export function EnergyBills({
           market,
           data?.contractedUsdMonth ?? 0,
           account || 'nao informada',
+          data?.performanceSplitPct ?? 50,
         )
       : '';
 
@@ -1115,12 +1154,18 @@ export function EnergyBills({
           </div>
 
           {/* --------------------------------- desconto por indisponibilidade */}
+          {/* Dois descontos com regras diferentes, lado a lado: a parada devolve
+              energia que nao foi consumida (credito integral); o desempenho
+              abaixo da faixa e servico que nao foi entregue (rateio acordado).
+              Embaixo, o total que cai na proxima fatura e, a parte, o que isso
+              custou em producao. Os detalhes e documentos ficam no fim. */}
           {dt && (
             <div className="mt-3 border-t border-phos/15 pt-2">
               <div className="mb-2 flex flex-wrap items-baseline justify-between gap-2">
-                <span className="panel-title">Desconto proporcional por maquina parada</span>
+                <span className="panel-title">
+                  O que a fazenda deixou de entregar em {mesLabel(emCurso.month)}
+                </span>
                 <span className="text-[0.6rem] dimmer">
-                  competencia de {mesLabel(month.slice(0, 7))} ·{' '}
                   {dt.observedFrom
                     ? `observando desde ${new Date(dt.observedFrom).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })}`
                     : 'sem observacao'}{' '}
@@ -1128,30 +1173,205 @@ export function EnergyBills({
                 </span>
               </div>
 
-              {/* Maquina parada fora da queda geral: some no meio da tabela */}
-              {dt.individualPeriods.length > 0 && (
-                <div className="mb-3 border border-crit/50 p-2">
+              <div className="grid gap-3 lg:grid-cols-2">
+                {/* ---------------- paradas: credito integral */}
+                <div className="border border-crit/40 p-2">
+                  <div className="flex flex-wrap items-baseline justify-between gap-2">
+                    <span className="panel-title text-crit">Paradas · credito integral</span>
+                    <span className="text-[0.6rem] dimmer">maquina parada nao consome energia</span>
+                  </div>
+                  {paradas.length === 0 && dt.importedPeriods.length === 0 ? (
+                    <p className="mt-2 text-[0.68rem] dim">
+                      Nenhuma parada registrada na janela observada — sem credito a reivindicar.
+                    </p>
+                  ) : (
+                    <>
+                      <div className="mt-2">
+                        <Stat
+                          label="Credito"
+                          value={fmtUsd(dt.combinedCreditUsd)}
+                          sub={`≈ ${fmtNum(dt.combinedCreditSats)} sats · ${fmtMoney(dt.combinedCreditUsd * (est.brl / Math.max(est.usd, 1e-9)), 'BRL', true)}`}
+                          tone="warn"
+                        />
+                      </div>
+                      <div className="mt-2 space-y-0.5">
+                        <KeyValue
+                          k="Horas-maquina paradas"
+                          v={`${dt.totalDownHours.toFixed(1)} h`}
+                          hint="Soma das horas paradas de todas as maquinas — base do credito, nao e tempo de relogio"
+                        />
+                        <KeyValue
+                          k="Por maquina"
+                          v={`${dt.avgDownHours.toFixed(1)} h em media (${dt.affected} afetada${dt.affected === 1 ? '' : 's'}) · pior ${dt.worstDownHours.toFixed(1)} h`}
+                        />
+                        <KeyValue
+                          k="Fazenda inteira parada"
+                          v={
+                            dt.importedOutageHours > 0
+                              ? `${dt.combinedOutageHours.toFixed(2)} h (${dt.fullOutageHours.toFixed(2)} medida + ${dt.importedOutageHours.toFixed(2)} recuperada)`
+                              : `${dt.combinedOutageHours.toFixed(2)} h`
+                          }
+                          tone={dt.combinedOutageHours > 0 ? 'crit' : undefined}
+                        />
+                        <KeyValue
+                          k="Maquinas paradas sozinhas"
+                          v={`${horasSozinhas.toFixed(1)} h · ${dt.individualPeriods.length} episodio(s)`}
+                          tone={individuaisEmCurso > 0 ? 'crit' : undefined}
+                        />
+                      </div>
+                    </>
+                  )}
+                </div>
+
+                {/* ---------------- desempenho: rateio acordado */}
+                <div className="border border-warn/40 p-2">
+                  <div className="flex flex-wrap items-baseline justify-between gap-2">
+                    <span className="panel-title text-warn">
+                      Abaixo de {dt.lowFleet.thresholdPct}% do nominal · rateio de {fatiaDesempenho}%
+                    </span>
+                    <span className="text-[0.6rem] dimmer">ligada, mas entregando menos</span>
+                  </div>
+                  {dt.lowFleet.hours > 0.05 ? (
+                    <>
+                      <div className="mt-2">
+                        <Stat
+                          label={`Rateio acordado (${fatiaDesempenho}%)`}
+                          value={fmtUsd((dt.lowFleet.suggestedUsd * fatiaDesempenho) / 100)}
+                          sub={`≈ ${fmtNum(Math.round((dt.lowFleet.suggestedSats * fatiaDesempenho) / 100))} sats · de ${fmtUsd(dt.lowFleet.suggestedUsd)} medidos`}
+                          tone="warn"
+                        />
+                      </div>
+                      <div className="mt-2 space-y-0.5">
+                        <KeyValue
+                          k={`Fazenda abaixo de ${dt.lowFleet.thresholdPct}%`}
+                          v={`${dt.lowFleet.hours.toFixed(1)} h · ${dt.lowFleet.events.length} episodio(s)`}
+                          hint="Tempo de relogio com a fazenda inteira produzindo abaixo do limite"
+                        />
+                        <KeyValue
+                          k="Producao nao entregue"
+                          v={`${dt.lowFleet.lostEquivHours.toFixed(1)} horas-maquina`}
+                          hint="O que faltou para o nominal, convertido em horas de maquina parada. So conta maquina ligada: a parada ja entra no credito"
+                        />
+                        <KeyValue k="Maquinas abaixo do nominal" v={`${dt.lowFleet.byWorker.length}`} />
+                      </div>
+                    </>
+                  ) : (
+                    <p className="mt-2 text-[0.68rem] dim">
+                      A fazenda nao ficou abaixo de {dt.lowFleet.thresholdPct}% do nominal na janela observada.
+                    </p>
+                  )}
+                </div>
+              </div>
+
+              {/* ---------------- total que cai na proxima fatura */}
+              {(() => {
+                const rateioUsd = dt.lowFleet.hours > 0.05 ? (dt.lowFleet.suggestedUsd * fatiaDesempenho) / 100 : 0;
+                const rateioSats =
+                  dt.lowFleet.hours > 0.05 ? Math.round((dt.lowFleet.suggestedSats * fatiaDesempenho) / 100) : 0;
+                const [ano, mes] = emCurso.month.split('-').map(Number);
+                const proximo = `${mes === 12 ? ano + 1 : ano}-${String(mes === 12 ? 1 : mes + 1).padStart(2, '0')}`;
+                return (
+                  <div className="mt-3 flex flex-wrap items-baseline justify-between gap-2 border border-phos/40 p-2">
+                    <span className="panel-title">Total a abater na fatura de {mesLabel(proximo)}</span>
+                    <span>
+                      <span className="hot text-base">{fmtUsd(dt.combinedCreditUsd + rateioUsd)}</span>
+                      <span className="dim text-[0.68rem]">
+                        {' '}
+                        ≈ {fmtNum(dt.combinedCreditSats + rateioSats)} sats · credito {fmtUsd(dt.combinedCreditUsd)} +
+                        rateio {fmtUsd(rateioUsd)} · parcial, o mes ainda corre
+                      </span>
+                    </span>
+                  </div>
+                );
+              })()}
+
+              {/* ---------------- producao perdida, em satoshis */}
+              {dt.producaoPerdida && dt.producaoPerdida.totalSats > 0 && (
+                <div className="mt-3 border border-phos/25 p-2">
+                  <div className="flex flex-wrap items-baseline justify-between gap-2">
+                    <span className="panel-title">Producao perdida — o que deixou de ser minerado</span>
+                    <span className="text-[0.6rem] dimmer">receita, nao energia · estimativa</span>
+                  </div>
+                  <div className="mt-2 grid grid-cols-2 gap-3 lg:grid-cols-4">
+                    <Stat
+                      label="Total perdido"
+                      value={`${fmtNum(dt.producaoPerdida.totalSats)} sats`}
+                      sub={fmtMoney(satsToFiat(dt.producaoPerdida.totalSats), currency, true)}
+                      tone="crit"
+                    />
+                    <Stat
+                      label="Por paradas"
+                      value={`${fmtNum(dt.producaoPerdida.paradasSats)} sats`}
+                      sub={`${fmtPct((dt.producaoPerdida.paradasSats / dt.producaoPerdida.totalSats) * 100, 0)} da perda`}
+                    />
+                    <Stat
+                      label="Por desempenho"
+                      value={`${fmtNum(dt.producaoPerdida.desempenhoSats)} sats`}
+                      sub={`${fmtPct((dt.producaoPerdida.desempenhoSats / dt.producaoPerdida.totalSats) * 100, 0)} da perda`}
+                    />
+                    <Stat
+                      label="O abatimento devolve"
+                      value={`${fmtNum(dt.producaoPerdida.abatimentoSats)} sats`}
+                      sub={`${fmtPct((dt.producaoPerdida.abatimentoSats / dt.producaoPerdida.totalSats) * 100, 0)} do que foi perdido`}
+                      tone="warn"
+                    />
+                  </div>
+                  <p className="mt-2 text-[0.62rem] dimmer">
+                    O que a conta deixou de receber frente ao nominal da fazenda, vezes o rendimento que a pool pagou
+                    neste mes:{' '}
+                    {fmtNum(Math.round(dt.producaoPerdida.satsPorThh * 24))} sats por TH/s por dia, em{' '}
+                    {dt.producaoPerdida.diasRendimento} dias fechados. O abatimento devolve custo de energia; esta e a
+                    receita que nao entrou.
+                  </p>
+                </div>
+              )}
+
+              {/* ---------------- detalhes e documentos */}
+              <div className="mt-3 flex flex-wrap gap-2">
+                {paradas.length > 0 && (
                   <button
-                    className="flex w-full flex-wrap items-baseline gap-x-2 text-left"
+                    className="term-btn !py-[2px] !px-2 !text-[0.62rem]"
+                    onClick={() => setVerDetalhe(!verDetalhe)}
+                    aria-expanded={verDetalhe}
+                  >
+                    {verDetalhe ? '▼' : '▶'} detalhe por maquina ({paradas.length})
+                  </button>
+                )}
+                {dt.individualPeriods.length > 0 && (
+                  <button
+                    className="term-btn !py-[2px] !px-2 !text-[0.62rem]"
                     onClick={() => setVerIndividuais(!verIndividuais)}
                     aria-expanded={verIndividuais}
                   >
-                    <span className="panel-title text-crit">
-                      {verIndividuais ? '▼' : '▶'} Paradas individuais ({dt.individualPeriods.length}) — fora das
-                      quedas gerais
-                    </span>
+                    {verIndividuais ? '▼' : '▶'} paradas individuais ({dt.individualPeriods.length})
                     {individuaisEmCurso > 0 && (
-                      <span className="blink-crit text-[0.6rem] text-crit">{individuaisEmCurso} em curso</span>
+                      <span className="blink-crit text-crit"> · {individuaisEmCurso} em curso</span>
                     )}
-                    <span className="ml-auto text-[0.6rem] dimmer">
-                      {horasSozinhas.toFixed(1)}h sozinhas no total
-                    </span>
                   </button>
-                  <ul
-                    className={`mt-1 max-h-56 space-y-0.5 overflow-y-auto pr-1 text-[0.68rem] ${
-                      verIndividuais ? '' : 'hidden'
-                    }`}
+                )}
+                {(paradas.length > 0 || dt.importedPeriods.length > 0) && (
+                  <button
+                    className={`term-btn !py-[2px] !px-2 !text-[0.62rem] ${relatorio ? 'inverse' : ''}`}
+                    onClick={() =>
+                      relatorio
+                        ? setRelatorio(null)
+                        : setRelatorio(montarRelatorioParadas(emCurso.month, dt, account || 'nao informada'))
+                    }
+                    title="Documento com eventos, detalhe por maquina e consolidado, para negociar o credito"
                   >
+                    relatorio de paradas
+                  </button>
+                )}
+              </div>
+
+              {/* Maquina parada fora da queda geral: some no meio da tabela */}
+              {dt.individualPeriods.length > 0 && verIndividuais && (
+                <div className="mt-2 border border-crit/50 p-2">
+                  <div className="flex flex-wrap items-baseline gap-x-2">
+                    <span className="panel-title text-crit">Paradas individuais — fora das quedas gerais</span>
+                    <span className="ml-auto text-[0.6rem] dimmer">{horasSozinhas.toFixed(1)}h sozinhas no total</span>
+                  </div>
+                  <ul className="mt-1 max-h-56 space-y-0.5 overflow-y-auto pr-1 text-[0.68rem]">
                     {dt.individualPeriods.map((p) => {
                       const emCursoAgora = p.to >= dt.until - 5 * 60_000;
                       return (
@@ -1184,7 +1404,7 @@ export function EnergyBills({
 
               {/* Quedas recuperadas da serie da pool, anteriores a nossa coleta */}
               {dt.importedPeriods.length > 0 && (
-                <div className="mb-3 border border-warn/40 p-2">
+                <div className="mt-2 border border-warn/40 p-2">
                   <div className="flex flex-wrap items-baseline justify-between gap-2">
                     <span className="panel-title text-warn">
                       Quedas recuperadas do historico da pool ({dt.importedPeriods.length})
@@ -1217,188 +1437,81 @@ export function EnergyBills({
                 </div>
               )}
 
-              {dt.lowFleet.hours > 0.05 && (
-                <div className="mb-3 border border-warn/40 p-2">
-                  <div className="flex flex-wrap items-baseline justify-between gap-2">
-                    <span className="panel-title text-warn">
-                      Fazenda abaixo de {dt.lowFleet.thresholdPct}% do nominal
-                    </span>
-                    <span className="text-[0.6rem] dimmer">adicional para negociacao · fora do credito</span>
+              <div className={`mt-2 overflow-x-auto ${verDetalhe && paradas.length > 0 ? '' : 'hidden'}`}>
+                <table className="term">
+                  <thead>
+                    <tr>
+                      <th>Maquina</th>
+                      <th>Horas paradas</th>
+                      <th>% da janela</th>
+                      <th>Contrato</th>
+                      <th>Credito</th>
+                      <th>Em satoshis</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {paradas.map((m) => (
+                      <tr key={m.worker}>
+                        <td className="hot">{m.label}</td>
+                        <td>{m.downHours.toFixed(2)} h</td>
+                        <td>
+                          <div className="flex items-center gap-2">
+                            <span className={m.downPct > 5 ? 'text-warn' : ''}>{fmtPct(m.downPct, 1)}</span>
+                            <div className="w-20">
+                              <Meter
+                                ratio={m.downPct / 100}
+                                segments={12}
+                                height={6}
+                                tone={m.downPct > 5 ? 'warn' : 'normal'}
+                              />
+                            </div>
+                          </div>
+                        </td>
+                        <td className="dim">{fmtUsd(m.monthlyUsd, true)}/mes</td>
+                        <td className="text-warn">{fmtUsd(m.creditUsd)}</td>
+                        <td className="text-warn">≈ {fmtNum(m.creditSats)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+
+              {relatorio && (
+                <div className="mt-3 border border-phos/40 p-2">
+                  <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                    <span className="panel-title">Relatorio de paradas — para negociar o credito</span>
+                    <div className="flex items-center gap-2">
+                      {relatorioCopiado && <span className="text-[0.65rem] hot">COPIADO</span>}
+                      <button
+                        className="term-btn !py-[2px] !px-3 !text-[0.62rem]"
+                        onClick={async () => {
+                          try {
+                            await copiarTexto(relatorio);
+                            setRelatorioCopiado(true);
+                            setTimeout(() => setRelatorioCopiado(false), 2500);
+                          } catch {
+                            setRelatorioCopiado(false);
+                          }
+                        }}
+                      >
+                        copiar texto
+                      </button>
+                      <button className="term-btn !py-[2px] !px-3 !text-[0.62rem]" onClick={() => setRelatorio(null)}>
+                        fechar
+                      </button>
+                    </div>
                   </div>
-                  <div className="mt-2 grid grid-cols-2 gap-3 lg:grid-cols-4">
-                    <Stat
-                      label="Tempo abaixo da faixa"
-                      value={`${dt.lowFleet.hours.toFixed(2)} h`}
-                      sub={`${dt.lowFleet.events.length} episodio(s) na competencia`}
-                      hint="Tempo de relogio com a fazenda inteira produzindo abaixo do limite"
-                      tone="warn"
-                    />
-                    <Stat
-                      label="Producao nao entregue"
-                      value={`${dt.lowFleet.lostEquivHours.toFixed(2)} h`}
-                      sub="horas-maquina equivalentes"
-                      hint="O que faltou para o nominal, convertido em horas de maquina parada. So conta maquina ligada: a parada ja entra no credito"
-                    />
-                    <Stat
-                      label="Equivalente sugerido"
-                      value={fmtUsd(dt.lowFleet.suggestedUsd)}
-                      sub={`≈ ${fmtNum(dt.lowFleet.suggestedSats)} sats`}
-                      tone="warn"
-                    />
-                    <Stat
-                      label="Maquinas envolvidas"
-                      value={`${dt.lowFleet.byWorker.length}`}
-                      sub="entregaram menos que o nominal"
-                    />
-                  </div>
-                  <p className="mt-2 text-[0.62rem] dimmer">
-                    Maquina degradada consome a energia quase toda, entao isto nao e devolucao de consumo como a
-                    parada — e a parte do servico que nao foi entregue. Entra na previa do mes seguinte como item
-                    separado, com data e medicao.
-                  </p>
+                  <pre className="doc overflow-x-auto p-3 text-[0.66rem] leading-[1.45] whitespace-pre">{relatorio}</pre>
                 </div>
               )}
 
-              {paradas.length === 0 && dt.importedPeriods.length === 0 ? (
-                <p className="text-[0.68rem] dim">
-                  Nenhuma parada registrada na janela observada — sem desconto a reivindicar.
-                </p>
-              ) : (
-                <>
-                  <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-                    <Stat
-                      label="Parada por maquina"
-                      value={`${dt.avgDownHours.toFixed(2)} h`}
-                      sub={`media de ${dt.affected} afetada(s) · pior ${dt.worstDownHours.toFixed(2)} h`}
-                      hint="Tempo de relogio que cada maquina ficou sem produzir"
-                    />
-                    <Stat
-                      label="Horas-maquina paradas"
-                      value={`${dt.totalDownHours.toFixed(2)}`}
-                      sub={`soma das ${dt.miners.length} · base do rateio`}
-                      hint="Soma das horas paradas de todas as maquinas — nao e tempo de relogio"
-                    />
-                    <Stat
-                      label="Credito devido"
-                      value={`≈ ${fmtNum(dt.combinedCreditSats)} sats`}
-                      sub={`${fmtUsd(dt.combinedCreditUsd)} · medido + recuperado`}
-                      tone="warn"
-                    />
-                    <Stat
-                      label="Queda total da fazenda"
-                      value={`${dt.combinedOutageHours.toFixed(2)} h`}
-                      sub={
-                        dt.importedOutageHours > 0
-                          ? `${dt.fullOutageHours.toFixed(2)}h medida + ${dt.importedOutageHours.toFixed(2)}h recuperada`
-                          : 'todas as maquinas paradas juntas'
-                      }
-                      tone={dt.combinedOutageHours > 0 ? 'crit' : 'normal'}
-                    />
-                  </div>
-
-                  <div className="mt-3 flex flex-wrap gap-2">
-                    <button
-                      className="term-btn !py-[2px] !px-2 !text-[0.62rem]"
-                      onClick={() => setVerDetalhe(!verDetalhe)}
-                      aria-expanded={verDetalhe}
-                    >
-                      {verDetalhe ? '▼' : '▶'} detalhe por maquina ({paradas.length})
-                    </button>
-                    <button
-                      className={`term-btn !py-[2px] !px-2 !text-[0.62rem] ${relatorio ? 'inverse' : ''}`}
-                      onClick={() =>
-                        relatorio
-                          ? setRelatorio(null)
-                          : setRelatorio(
-                              montarRelatorioParadas(emCurso.month, dt, account || 'nao informada'),
-                            )
-                      }
-                      title="Documento com eventos, detalhe por maquina e consolidado, para negociar o credito"
-                    >
-                      relatorio de paradas
-                    </button>
-                  </div>
-
-                  <div className={`mt-2 overflow-x-auto ${verDetalhe ? '' : 'hidden'}`}>
-                    <table className="term">
-                      <thead>
-                        <tr>
-                          <th>Maquina</th>
-                          <th>Horas paradas</th>
-                          <th>% da janela</th>
-                          <th>Contrato</th>
-                          <th>Credito</th>
-                          <th>Em satoshis</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {paradas.map((m) => (
-                          <tr key={m.worker}>
-                            <td className="hot">{m.label}</td>
-                            <td>{m.downHours.toFixed(2)} h</td>
-                            <td>
-                              <div className="flex items-center gap-2">
-                                <span className={m.downPct > 5 ? 'text-warn' : ''}>{fmtPct(m.downPct, 1)}</span>
-                                <div className="w-20">
-                                  <Meter
-                                    ratio={m.downPct / 100}
-                                    segments={12}
-                                    height={6}
-                                    tone={m.downPct > 5 ? 'warn' : 'normal'}
-                                  />
-                                </div>
-                              </div>
-                            </td>
-                            <td className="dim">{fmtUsd(m.monthlyUsd, true)}/mes</td>
-                            <td className="text-warn">{fmtUsd(m.creditUsd)}</td>
-                            <td className="text-warn">≈ {fmtNum(m.creditSats)}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-
-                  {relatorio && (
-                    <div className="mt-3 border border-phos/40 p-2">
-                      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-                        <span className="panel-title">Relatorio de paradas — para negociar o credito</span>
-                        <div className="flex items-center gap-2">
-                          {relatorioCopiado && <span className="text-[0.65rem] hot">COPIADO</span>}
-                          <button
-                            className="term-btn !py-[2px] !px-3 !text-[0.62rem]"
-                            onClick={async () => {
-                              try {
-                                await copiarTexto(relatorio);
-                                setRelatorioCopiado(true);
-                                setTimeout(() => setRelatorioCopiado(false), 2500);
-                              } catch {
-                                setRelatorioCopiado(false);
-                              }
-                            }}
-                          >
-                            copiar texto
-                          </button>
-                          <button
-                            className="term-btn !py-[2px] !px-3 !text-[0.62rem]"
-                            onClick={() => setRelatorio(null)}
-                          >
-                            fechar
-                          </button>
-                        </div>
-                      </div>
-                      <pre className="doc overflow-x-auto p-3 text-[0.66rem] leading-[1.45] whitespace-pre">
-                        {relatorio}
-                      </pre>
-                    </div>
-                  )}
-
-                  <p className="mt-2 text-[0.62rem] dimmer">
-                    Maquina parada nao consome energia, entao as horas de queda viram credito sobre o contrato do mes.
-                    Maquina apenas degradada nao entra: ela continua puxando quase toda a potencia. O desconto so cobre
-                    o periodo que o coletor observou — quedas anteriores ao inicio da coleta nao aparecem aqui.
-                  </p>
-                </>
-              )}
+              <p className="mt-2 text-[0.62rem] dimmer">
+                <span className="dim">Paradas:</span> maquina parada nao consome energia, entao as horas de queda
+                viram credito integral sobre o contrato do mes. O desconto so cobre o periodo que o coletor observou.{' '}
+                <span className="dim">Desempenho:</span> maquina degradada consome a energia quase toda — o que falta e
+                servico nao entregue, e a causa pode estar dos dois lados, por isso entra pela fatia combinada, em linha
+                propria. As horas com a fazenda inteira parada ficam so no credito: nada e cobrado duas vezes.
+              </p>
             </div>
           )}
 
@@ -1817,6 +1930,16 @@ export function EnergyBills({
               <button className="term-btn !py-[2px] !px-3 !text-[0.62rem]" onClick={copiar}>
                 copiar texto
               </button>
+              {/* Link direto em vez de fetch: o navegador baixa sozinho, e
+                  download por script e justamente o que falha em contexto
+                  inseguro, que e como este painel roda na rede privada. */}
+              <a
+                className="term-btn !py-[2px] !px-3 !text-[0.62rem]"
+                href={`/api/extrato-xlsx?month=${billExtrato.month}&conta=${encodeURIComponent(account || 'nao informada')}`}
+                title="Mesma fatura em planilha, com uma aba por medicao e a cotacao em celula editavel"
+              >
+                baixar planilha
+              </a>
               <button
                 className="term-btn !py-[2px] !px-3 !text-[0.62rem]"
                 onClick={() => setExtratoMes(null)}

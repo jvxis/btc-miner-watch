@@ -310,9 +310,20 @@ export function Led({ state }: { state: 'online' | 'recovering' | 'degraded' | '
   );
 }
 
-export function KeyValue({ k, v, tone }: { k: string; v: ReactNode; tone?: 'crit' | 'warn' }) {
+export function KeyValue({
+  k,
+  v,
+  tone,
+  hint,
+}: {
+  k: string;
+  v: ReactNode;
+  tone?: 'crit' | 'warn';
+  /** explicacao no passar do mouse, como no Stat */
+  hint?: string;
+}) {
   return (
-    <div className="flex items-baseline justify-between gap-3 py-[3px] text-[0.78rem]">
+    <div className="flex items-baseline justify-between gap-3 py-[3px] text-[0.78rem]" title={hint}>
       <span className="dim truncate">{k}</span>
       <span className={`shrink-0 ${tone === 'crit' ? 'text-crit' : tone === 'warn' ? 'text-warn' : 'hot'}`}>{v}</span>
     </div>

@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 import { workerSeries } from '@/lib/db';
 import { buildOverview } from '@/lib/metrics';
-import { viabtc } from '@/lib/viabtc';
+import { POOLS } from '@/lib/pools';
 
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
@@ -17,10 +17,12 @@ export async function GET(req: Request, ctx: { params: Promise<{ worker: string 
 
     const bucket = hours <= 6 ? 5 : hours <= 48 ? 15 : 60;
     const series = workerSeries(worker, hours, bucket);
-    const poolDaily = await viabtc.workerHistory(miner.workerId, 30).catch(() => []);
+    // O historico diario vem da pool onde a maquina esta minerando agora.
+    const pool = POOLS[miner.pool];
+    const poolDaily = await pool.workerHistory({ id: miner.workerId, name: miner.worker }, 30).catch(() => []);
 
     return NextResponse.json(
-      { miner, series, poolDaily, totals: overview.totals, market: overview.market },
+      { miner, series, poolDaily, poolLabel: pool.label, totals: overview.totals, market: overview.market },
       { headers: { 'Cache-Control': 'no-store' } },
     );
   } catch (err) {

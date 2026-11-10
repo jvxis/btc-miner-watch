@@ -34,6 +34,10 @@ yarn-error.log*
 .env*
 !.env.example
 
+# documentos de competencia: dados da fazenda, nao codigo
+*.xlsx
+*.csv
+
 # banco local de snapshots
 /data
 

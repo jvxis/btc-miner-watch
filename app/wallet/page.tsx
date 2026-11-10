@@ -5,6 +5,8 @@ import { EnergyBills } from '@/components/EnergyBills';
 import { KeyValue, Meter, Panel, Stat } from '@/components/ui';
 import { useOverview, useWallet } from '@/lib/client';
 import { fmtBtc, fmtDateTime, fmtMoney, fmtNum, fmtPct, fmtSats } from '@/lib/format';
+import { diasFechados, janelaDeReceita, type ModoPagamento } from '@/lib/pools/modo';
+import { POOL_LABEL, type PoolId } from '@/lib/pools/types';
 
 interface Day {
   date: string;
@@ -26,6 +28,9 @@ interface Payment {
   create_time: number;
 }
 
+/** '2026-01-15' vira '15/01'. */
+const diaCurto = (dia: string): string => dia.slice(8, 10) + '/' + dia.slice(5, 7);
+
 export default function WalletPage() {
   const { data, error } = useWallet();
   const { data: overview } = useOverview();
@@ -45,8 +50,9 @@ export default function WalletPage() {
   const dailyCostCur = cur === 'BRL' ? dailyCost : dailyCost / (market.usdBrl || 1);
   const toCur = (brlValue: number) => (cur === 'BRL' ? brlValue : brlValue / (market.usdBrl || 1));
 
-  // Media dos ultimos 7 dias fechados (ignora o dia corrente, ainda parcial).
-  const closed = days.slice(1, 8);
+  // Media dos dias fechados: a janela cresce quando a receita depende de bloco.
+  const modos: ModoPagamento[] = data.modos ?? [];
+  const closed = diasFechados(days, janelaDeReceita(modos), new Date().toLocaleDateString('sv-SE'));
   const avgBtc = closed.length ? closed.reduce((s, d) => s + d.total, 0) / closed.length : 0;
 
   const ultimos30 = days.slice(0, 30);
@@ -105,6 +111,19 @@ export default function WalletPage() {
               <Meter ratio={ppsShare} segments={20} height={7} />
             </div>
             <div className="mt-2 space-y-0.5">
+              {modos.map((m) => (
+                <KeyValue
+                  key={m.pool}
+                  k={modos.length > 1 ? `Ultimo dia pago (${POOL_LABEL[m.pool]})` : 'Ultimo dia pago'}
+                  v={`${m.rotulo} (${diaCurto(m.dia)})`}
+                  tone={m.modo === 'misto' ? 'warn' : undefined}
+                  hint={
+                    `${fmtPct(m.fatias.pps, 1)} PPS, ${fmtPct(m.fatias.pplns, 1)} PPLNS, ` +
+                    `${fmtPct(m.fatias.solo, 1)} Solo. Neste modo desde ${diaCurto(m.desde)}. ` +
+                    'A pool nao informa o modo; uma troca aparece quando ela fecha o primeiro dia no modo novo.'
+                  }
+                />
+              ))}
               <KeyValue k="PPS" v={fmtBtc(data.summary?.pps ?? 0)} />
               <KeyValue k="PPLNS" v={fmtBtc(data.summary?.pplns ?? 0)} />
               <KeyValue k="Solo" v={fmtBtc(data.summary?.solo ?? 0)} />
@@ -154,7 +173,7 @@ export default function WalletPage() {
         </Panel>
       </div>
 
-      <Panel title="Projecao de receita" right="media dos ultimos 7 dias fechados">
+      <Panel title="Projecao de receita" right={`media dos ultimos ${closed.length} dias fechados`}>
         <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
           {projections.map((p) => {
             const revenue = p.btc * price;
@@ -270,17 +289,25 @@ export default function WalletPage() {
 
       <EnergyBills currency={cur} account={data.account?.name ?? ''} />
 
-      <Panel title="Conta ViaBTC">
+      <Panel title="Conta na pool">
         <div className="grid gap-x-8 sm:grid-cols-2">
           <div>
             <KeyValue k="Conta" v={data.account.name} />
             <KeyValue k="E-mail" v={data.account.email ?? '—'} />
-            <KeyValue k="Cliente desde" v={fmtDateTime(data.account.createdAt)} />
+            <KeyValue k="Cliente desde" v={data.account.createdAt ? fmtDateTime(data.account.createdAt) : '—'} />
           </div>
           <div>
-            {(data.balances as { coin: string; amount: number }[]).map((b) => (
-              <KeyValue key={b.coin} k={`Saldo ${b.coin}`} v={fmtNum(b.amount, 8)} />
+            {((data.accounts ?? []) as { pool: string; balanceBtc: number }[]).map((a) => (
+              <KeyValue
+                key={a.pool}
+                k={`Saldo ${POOL_LABEL[a.pool as PoolId] ?? a.pool}`}
+                v={`${fmtNum(a.balanceBtc, 8)} BTC`}
+              />
             ))}
+            {(data.accounts ?? []).length > 1 &&
+              (data.balances as { coin: string; amount: number }[]).map((b) => (
+                <KeyValue key={b.coin} k={`Saldo total ${b.coin}`} v={fmtNum(b.amount, 8)} />
+              ))}
           </div>
         </div>
         <div className="mt-2 border-t border-phos/15 pt-2 text-[0.68rem] dim">

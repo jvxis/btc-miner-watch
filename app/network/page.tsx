@@ -3,7 +3,8 @@
 import { useState } from 'react';
 import { Gauge, KeyValue, Meter, Panel, Stat } from '@/components/ui';
 import { useNow, useOverview } from '@/lib/client';
-import { fmtBrl, fmtDuration, fmtHash, fmtHashHs, fmtMoney, fmtNum, fmtPct } from '@/lib/format';
+import { fmtBrl, fmtDateTime, fmtDuration, fmtHash, fmtHashHs, fmtMoney, fmtNum, fmtPct } from '@/lib/format';
+import { notaDeBloco } from '@/lib/pools/modo';
 
 export default function NetworkPage() {
   const { data, error } = useOverview();
@@ -18,6 +19,9 @@ export default function NetworkPage() {
 
   const tariff = tariffOverride ?? data.settings.tariffBrl;
   const { market: k, totals: t } = data;
+  const ultimoBloco = data.poolBlocks.recentes[0] ?? null;
+  // Com duas pools, vale a explicacao de quem depende do bloco.
+  const modoBlocos = data.pools.modos.find((m) => m.dependeDeBloco) ?? data.pools.modos[0] ?? null;
   const ref = now || data.generatedAt;
   const halvingIn = k.halvingDate ? (k.halvingDate - ref) / 1000 : null;
   const retargetIn = k.difficultyRetargetDate ? (k.difficultyRetargetDate - ref) / 1000 : null;
@@ -160,6 +164,101 @@ export default function NetworkPage() {
       </div>
 
       {/* -------------------------------------------------- simulador */}
+      {/* ------------------------------------------- blocos da pool */}
+      <Panel
+        title="Blocos encontrados pela pool"
+        right={
+          data.poolBlocks.stats?.share7dPct != null
+            ? `${fmtPct(data.poolBlocks.stats.share7dPct, 1)} da rede em 7 dias`
+            : 'fonte: mempool.space'
+        }
+      >
+        {data.poolBlocks.recentes.length === 0 && data.poolBlocks.stats === null ? (
+          <p className="dim text-xs">
+            Ainda sem dado de bloco. O coletor consulta a rede a cada cinco minutos — a origem de cada bloco vem da
+            assinatura do coinbase, pelo mempool.space, e vale para a pool escolhida em configuracoes.
+          </p>
+        ) : (
+          <>
+            <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+              <Stat
+                label="Nas ultimas 24h"
+                value={data.poolBlocks.stats?.blocks24h != null ? String(data.poolBlocks.stats.blocks24h) : '—'}
+                sub={
+                  data.poolBlocks.stats?.share24hPct != null
+                    ? `${fmtPct(data.poolBlocks.stats.share24hPct, 1)} dos blocos da rede`
+                    : undefined
+                }
+                size="lg"
+              />
+              <Stat
+                label="Nos ultimos 7 dias"
+                value={data.poolBlocks.stats?.blocks7d != null ? String(data.poolBlocks.stats.blocks7d) : '—'}
+                sub={
+                  data.poolBlocks.stats?.blocks7d
+                    ? `um a cada ${fmtDuration((7 * 86400 * 1000) / data.poolBlocks.stats.blocks7d)}`
+                    : undefined
+                }
+                size="lg"
+              />
+              <Stat
+                label="Ultimo bloco"
+                value={ultimoBloco ? `#${ultimoBloco.height}` : '—'}
+                sub={
+                  ultimoBloco && now
+                    ? `ha ${fmtDuration(now - ultimoBloco.ts)}`
+                    : ultimoBloco
+                      ? fmtDateTime(ultimoBloco.ts)
+                      : undefined
+                }
+                tone={ultimoBloco && now && now - ultimoBloco.ts > 6 * 3600_000 ? 'warn' : 'normal'}
+              />
+              <Stat
+                label="Hashrate da pool"
+                value={data.poolBlocks.stats?.hashrate != null ? fmtHashHs(data.poolBlocks.stats.hashrate, 1) : '—'}
+                sub={
+                  data.poolBlocks.stats?.hashrate && t.hashrate1h > 0
+                    ? `voce e ${((t.hashrate1h * 1e12) / data.poolBlocks.stats.hashrate * 100).toFixed(3)}% dela`
+                    : undefined
+                }
+              />
+            </div>
+
+            {data.poolBlocks.recentes.length > 0 && (
+              <div className="mt-3 max-h-56 overflow-y-auto border-t border-phos/15 pt-2">
+                <table className="term">
+                  <thead>
+                    <tr>
+                      <th>Altura</th>
+                      <th>Quando</th>
+                      <th>Recompensa</th>
+                      <th>Taxas</th>
+                      <th>Txs</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {data.poolBlocks.recentes.map((b) => (
+                      <tr key={b.height}>
+                        <td className="hot">#{b.height}</td>
+                        <td className="dim">{fmtDateTime(b.ts)}</td>
+                        <td>{(b.rewardSats / 1e8).toFixed(4)} BTC</td>
+                        <td className="dim">{(b.feesSats / 1e8).toFixed(4)}</td>
+                        <td className="dimmer">{fmtNum(b.txCount, 0)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+
+            <p className="mt-2 text-[0.62rem] dimmer">
+              {notaDeBloco(modoBlocos)} A cadencia serve para ver se a pool continua competitiva: menos blocos por dia
+              que a fatia de hashrate dela sugere e sinal de azar, ou de problema.
+            </p>
+          </>
+        )}
+      </Panel>
+
       <Panel title="Simulador de cenarios" right="ajuste os controles e veja o resultado">
         <div className="grid gap-6 lg:grid-cols-3">
           <div className="space-y-4">
@@ -265,7 +364,7 @@ export default function NetworkPage() {
                 v={`R$ ${(t.kwhDay > 0 ? simProfit / t.kwhDay : 0).toFixed(3)}`}
                 tone={simProfit < 0 ? 'crit' : undefined}
               />
-              <KeyValue k="Receita por TH/dia" v={`${((simRevenueBtc / Math.max(1, t.hashrate1h)) * 1e8).toFixed(0)} sats`} />
+              <KeyValue k="Receita por TH/dia" v={`${(t.satsPerThDay * (100 / diffMult)).toFixed(0)} sats`} />
             </div>
 
             {/* O contrato em dolar faz o custo em satoshis cair quando o BTC sobe. */}

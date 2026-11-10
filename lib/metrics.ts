@@ -1,22 +1,26 @@
 import {
   avgHashrateByWorker,
   degradedSinceMap,
+  entregaDiaria,
   fleetAverage,
   fleetSeries,
+  poolHourly,
   profitDays,
   recentHashrates,
   recentSparklines,
   recentEvents,
 } from './db';
+import { blocosRecentes, estatisticasDaPool } from './blocks';
 import { dailyCostResolver } from './energy';
 import { isOffline as offline } from './health';
 import { fmtClock, fmtDuration } from './format';
 import { blockSubsidy, fetchMarket } from './market';
 import { pollStatus } from './poller';
 import { paybackDe, retornoMedido } from './payback';
-import { minerConfig, minerCost, syncMiners } from './settings';
-import type { Alert, FleetTotals, MinerView, OverviewPayload, Settings } from './types';
-import { num, toTh, viabtc } from './viabtc';
+import { getSettings, minerConfig, minerCost, syncMiners } from './settings';
+import type { Alert, FleetTotals, MediaDesdeInicio, MinerView, OverviewPayload, Settings } from './types';
+import { lerGrafico, lerMaquinas, modosAtivos, poolPrincipal, poolsAtivas, poolsDisponiveis, rotuloFonte } from './pools';
+import { diasFechados, janelaDeReceita } from './pools/modo';
 
 const median = (xs: number[]): number => {
   if (xs.length === 0) return 0;
@@ -27,22 +31,38 @@ const median = (xs: number[]): number => {
 
 const clamp = (v: number, lo = 0, hi = 100): number => Math.min(hi, Math.max(lo, v));
 
+/** Leituras produzindo (1 por minuto) para o ritmo de 24h valer: 1 hora. */
+const MIN_LEITURAS_RITMO = 60;
+
 /**
  * Receita por TH/s por dia.
- * Preferimos o numero real: media dos ultimos dias pagos pela pool dividida
- * pelo hashrate da fazenda. Sem historico, caimos no valor teorico da rede.
+ *
+ * Preferimos o numero real: o que a pool pagou nos ultimos dias fechados sobre
+ * o que a fazenda entregou nesses mesmos dias. Dividir pelo hashrate de agora
+ * subestima o rendimento depois que a fazenda cresce e superestima depois de
+ * uma queda, e o erro aumenta com a janela. Sem esse registro, cai no hashrate
+ * atual; sem historico nenhum, no valor teorico da rede.
  */
 function revenuePerThDay(
   fleetTh: number,
   days: { date: string; total: number }[],
+  janelaDias: number,
   difficulty: number | null,
   height: number | null,
 ): { btcPerThDay: number; source: 'pool' | 'rede' } {
-  // Ignora o dia corrente, que ainda esta incompleto.
-  const usable = days.slice(1, 8).filter((d) => d.total > 0);
-  if (usable.length >= 2 && fleetTh > 0) {
-    const avgBtc = usable.reduce((s, d) => s + d.total, 0) / usable.length;
-    return { btcPerThDay: avgBtc / fleetTh, source: 'pool' };
+  const usable = diasFechados(days, janelaDias, new Date().toLocaleDateString('sv-SE'));
+  if (usable.length >= 2) {
+    const entregue = entregaDiaria(usable[usable.length - 1].date, usable[0].date);
+    const medidos = usable.filter((d) => (entregue.get(d.date) ?? 0) > 0);
+    if (medidos.length >= 2) {
+      const btc = medidos.reduce((s, d) => s + d.total, 0);
+      const thDias = medidos.reduce((s, d) => s + (entregue.get(d.date) ?? 0) / 24, 0);
+      return { btcPerThDay: btc / thDias, source: 'pool' };
+    }
+    if (fleetTh > 0) {
+      const avgBtc = usable.reduce((s, d) => s + d.total, 0) / usable.length;
+      return { btcPerThDay: avgBtc / fleetTh, source: 'pool' };
+    }
   }
   if (difficulty && difficulty > 0) {
     const subsidy = blockSubsidy(height);
@@ -53,19 +73,52 @@ function revenuePerThDay(
   return { btcPerThDay: 0, source: 'rede' };
 }
 
+/**
+ * Media desde o inicio da operacao, pela serie horaria da pool.
+ *
+ * As horas de parada entram como zero: e o que a fazenda entregou de fato. As
+ * medias de 7 e 30 dias, que vem dos snapshots, deixam esses instantes de
+ * fora — por isso esta tende a ficar abaixo delas.
+ */
+function mediaDesdeInicio(settings: Settings, now: number): MediaDesdeInicio | null {
+  const inicio = settings.miningStartedAt ?? 0;
+  const pontos = poolHourly(inicio);
+  // Antes do primeiro ponto com producao, a serie da pool e enchimento.
+  const primeiro = pontos.findIndex((p) => p.hashrate > 0);
+  if (primeiro < 0) return null;
+  const serie = pontos.slice(primeiro);
+  if (serie.length < 24) return null;
+
+  // Cada maquina so entra no nominal depois de existir.
+  const entradas = settings.miners
+    .filter((m) => m.enabled && m.nominalTh > 0)
+    .map((m) => ({ desde: m.startedAt ?? m.firstHashAt ?? m.addedAt ?? inicio, th: m.nominalTh }));
+
+  let somaH = 0;
+  let somaN = 0;
+  for (const p of serie) {
+    somaH += p.hashrate;
+    somaN += entradas.reduce((a, m) => a + (m.desde <= p.ts ? m.th : 0), 0);
+  }
+  return {
+    avg: somaH / serie.length,
+    days: (now - serie[0].ts) / 86_400_000,
+    from: serie[0].ts,
+    pctNominal: somaN > 0 ? somaH / somaN : null,
+  };
+}
+
 export async function buildOverview(): Promise<OverviewPayload> {
-  const [workers, account, market, summary] = await Promise.all([
-    viabtc.workers(),
-    viabtc.accountHashrate(),
+  const escolha = getSettings();
+  const ativas = poolsAtivas(escolha);
+  const [{ workers, account }, market, resumos, contas] = await Promise.all([
+    lerMaquinas(escolha),
     fetchMarket(),
-    viabtc.profitSummary().catch(() => null),
+    Promise.all(ativas.map((p) => p.profitSummary().catch(() => null))),
+    Promise.all(ativas.map((p) => p.account().catch(() => null))),
   ]);
 
-  const accountInfo = await viabtc.account().catch(() => null);
-
-  const settings: Settings = syncMiners(
-    workers.map((w) => ({ worker: w.worker_name, hashing: toTh(w.hashrate_10min) > 0 })),
-  );
+  const settings: Settings = syncMiners(workers.map((w) => ({ worker: w.name, hashing: w.h10m > 0 })));
   const now = Date.now();
 
   const avg24 = avgHashrateByWorker(24);
@@ -77,31 +130,40 @@ export async function buildOverview(): Promise<OverviewPayload> {
   // Rateio da receita ja paga pela pool, dia a dia, para o payback por maquina.
   const retorno = retornoMedido(settings);
 
-  const fleet1h = workers.reduce((s, w) => s + toTh(w.hashrate_1hour), 0);
-  const fleet10m = workers.reduce((s, w) => s + toTh(w.hashrate_10min), 0);
-  const { btcPerThDay } = revenuePerThDay(fleet1h, days, market.difficulty, market.blockHeight);
+  const fleet1h = workers.reduce((s, w) => s + w.h1h, 0);
+  const fleet10m = workers.reduce((s, w) => s + w.h10m, 0);
+  const modos = modosAtivos(settings);
+  const { btcPerThDay } = revenuePerThDay(
+    fleet1h,
+    days,
+    janelaDeReceita(modos),
+    market.difficulty,
+    market.blockHeight,
+  );
 
-  const medianH = median(workers.map((w) => toTh(w.hashrate_1hour)).filter((h) => h > 0));
+  const medianH = median(workers.map((w) => w.h1h).filter((h) => h > 0));
+  /** Ritmo de 24h produzindo de cada maquina, inclusive das paradas agora. */
+  const ritmoPorMaquina = new Map<string, number>();
   const fixedDailyPerMiner =
     workers.length > 0 ? settings.fixedMonthlyCostBrl / 30 / workers.length : 0;
 
   const miners: MinerView[] = workers.map((w) => {
-    const cfg = minerConfig(settings, w.worker_name);
-    const h10m = toTh(w.hashrate_10min);
-    const h1h = toTh(w.hashrate_1hour);
-    const lastActive = w.last_active * 1000;
+    const cfg = minerConfig(settings, w.name);
+    const h10m = w.h10m;
+    const h1h = w.h1h;
+    const lastActive = w.lastActive;
     const secondsSinceShare = Math.max(0, Math.round((now - lastActive) / 1000));
 
-    const local = avg24.get(w.worker_name);
+    const local = avg24.get(w.name);
     const hashrate24hLocal = local && local.samples >= 3 ? local.avg : null;
     const uptime24h = local && local.samples >= 3 ? (local.online / local.samples) * 100 : null;
 
     const performance = cfg.nominalTh > 0 ? h1h / cfg.nominalTh : 0;
-    const rejectPct = num(w.reject_rate);
+    const rejectPct = w.rejectPct;
 
     // A referencia de status e a mediana das leituras de 10min dos ultimos
     // minutos. Sem historico local suficiente, cai na leitura instantanea.
-    const amostras = recentes.get(w.worker_name) ?? [];
+    const amostras = recentes.get(w.name) ?? [];
     const hashrateRef = amostras.length >= 3 ? median(amostras) : h10m;
     const performanceRef = cfg.nominalTh > 0 ? hashrateRef / cfg.nominalTh : 0;
 
@@ -118,7 +180,15 @@ export async function buildOverview(): Promise<OverviewPayload> {
     const costDayBrl = energy.dayBrl + fixedDailyPerMiner;
     const costDayUsd = market.usdBrl > 0 ? costDayBrl / market.usdBrl : energy.dayUsd;
 
-    const revenueDayBtc = btcPerThDay * h1h;
+    // Lucro e payback sao projecao, nao leitura do instante: valem o ritmo das
+    // ultimas 24 horas com a maquina produzindo. A media de 1 hora carrega uma
+    // parada por ate uma hora depois da volta e fazia a fazenda inteira parecer
+    // no prejuizo. Parada agora rende zero agora — o ritmo so
+    // vale para quem esta produzindo — e sem historico fica a media de 1 hora.
+    const ritmo =
+      local && local.online >= MIN_LEITURAS_RITMO && local.produzindo !== null ? local.produzindo : h1h;
+    ritmoPorMaquina.set(w.name, ritmo);
+    const revenueDayBtc = btcPerThDay * (isOffline ? 0 : ritmo);
     const revenueDayBrl = revenueDayBtc * market.btcBrl;
     const revenueDayUsd = revenueDayBtc * market.btcUsd;
 
@@ -132,9 +202,10 @@ export async function buildOverview(): Promise<OverviewPayload> {
     );
 
     return {
-      workerId: w.worker_id,
-      worker: w.worker_name,
-      label: cfg.label || w.worker_name,
+      workerId: w.id,
+      pool: w.pool,
+      worker: w.name,
+      label: cfg.label || w.name,
       location: cfg.location,
       status: isOffline ? 'offline' : isDegraded ? 'degraded' : isRecovering ? 'recovering' : 'online',
       hashrate10m: h10m,
@@ -162,12 +233,12 @@ export async function buildOverview(): Promise<OverviewPayload> {
       breakevenBtcBrl: revenueDayBtc > 0 ? costDayBrl / revenueDayBtc : 0,
       uptime24h,
       health,
-      degradedSince: degradadaDesde.get(w.worker_name) ?? null,
+      degradedSince: degradadaDesde.get(w.name) ?? null,
       payback: paybackDe(cfg, retorno, profitDayBrl, market),
       vsFleetPct: medianH > 0 ? ((h1h - medianH) / medianH) * 100 : 0,
-      sparkline: sparks.get(w.worker_name) ?? [],
-      onlineTime7d: w.online_time_7d ?? null,
-      onlineTime30d: w.online_time_30d ?? null,
+      sparkline: sparks.get(w.name) ?? [],
+      onlineTime7d: w.online7d,
+      onlineTime30d: w.online30d,
     };
   });
 
@@ -201,7 +272,7 @@ export async function buildOverview(): Promise<OverviewPayload> {
 
   const local24 = miners.map((m) => m.hashrate24hLocal).filter((v): v is number => v !== null);
   const uptimes = miners.map((m) => m.uptime24h).filter((v): v is number => v !== null);
-  const balanceBtc = num(accountInfo?.balance.find((b) => b.coin === viabtc.coin)?.amount ?? 0);
+  const balanceBtc = contas.reduce((s, c) => s + (c?.balanceBtc ?? 0), 0);
 
   const fleetHs = fleet1h * 1e12;
 
@@ -212,10 +283,11 @@ export async function buildOverview(): Promise<OverviewPayload> {
     hashrate24hLocal: local24.length === miners.length && local24.length > 0 ? local24.reduce((a, b) => a + b, 0) : null,
     hashrate7d: fleetAverage(24 * 7),
     hashrate30d: fleetAverage(24 * 30),
+    hashrateDesdeInicio: mediaDesdeInicio(settings, now),
     nominalTh,
     performance: nominalTh > 0 ? fleet1h / nominalTh : 0,
-    activeWorkers: account.active_workers,
-    inactiveWorkers: account.unactive_workers,
+    activeWorkers: account.active,
+    inactiveWorkers: account.inactive,
     totalWorkers: miners.length,
     rejectPct: miners.length ? miners.reduce((s, m) => s + m.rejectPct, 0) / miners.length : 0,
     powerKw,
@@ -250,7 +322,7 @@ export async function buildOverview(): Promise<OverviewPayload> {
     balanceBtc,
     balanceBrl: balanceBtc * market.btcBrl,
     balanceUsd: balanceBtc * market.btcUsd,
-    totalProfitBtc: num(summary?.total_profit ?? 0),
+    totalProfitBtc: resumos.reduce((s, r) => s + (r?.total ?? 0), 0),
     networkSharePpm: market.networkHashrate ? (fleetHs / market.networkHashrate) * 1e6 : null,
     uptime24h: uptimes.length ? uptimes.reduce((a, b) => a + b, 0) / uptimes.length : null,
   };
@@ -264,7 +336,7 @@ export async function buildOverview(): Promise<OverviewPayload> {
       id: 'pool',
       level: 'critical',
       worker: null,
-      title: 'Falha ao consultar a ViaBTC',
+      title: `Falha ao consultar a ${rotuloFonte(settings)}`,
       detail: status.message,
       since: status.lastAttempt,
     });
@@ -282,12 +354,14 @@ export async function buildOverview(): Promise<OverviewPayload> {
 
   for (const m of miners) {
     if (m.status === 'offline') {
+      // Parada rende zero na projecao; a perda e o que ela rendia produzindo.
+      const perdaBrl = btcPerThDay * (ritmoPorMaquina.get(m.worker) ?? 0) * market.btcBrl;
       alerts.push({
         id: `off:${m.worker}`,
         level: 'critical',
         worker: m.worker,
         title: `${m.label} offline`,
-        detail: `Sem shares ha ${Math.round(m.secondsSinceShare / 60)} min — perda estimada de ${(m.revenueDayBrl > 0 ? m.revenueDayBrl : (revenueDayBrl / Math.max(1, miners.length))).toFixed(2)} BRL/dia`,
+        detail: `Sem shares ha ${Math.round(m.secondsSinceShare / 60)} min — perda estimada de ${(perdaBrl > 0 ? perdaBrl : (revenueDayBrl / Math.max(1, miners.length))).toFixed(2)} BRL/dia`,
         since: m.lastActive,
       });
       continue;
@@ -331,13 +405,17 @@ export async function buildOverview(): Promise<OverviewPayload> {
     }
   }
 
-  if (totals.profitDayBrl < 0) {
+  // O alerta segue o mesmo lucro do painel, para card e alerta nunca
+  // discordarem: depois da volta de uma parada ele some na hora, e durante uma
+  // parada longa de parte da fazenda aparece, porque o prejuizo e real.
+  const faltaBrl = -profitDayBrl;
+  if (faltaBrl > 0) {
     alerts.push({
       id: 'negative',
       level: 'critical',
       worker: null,
       title: 'Operacao no prejuizo',
-      detail: `Custo de energia acima da receita em ${Math.abs(totals.profitDayBrl).toFixed(2)} BRL/dia`,
+      detail: `Custo de energia acima da receita em ${faltaBrl.toFixed(2)} BRL/dia, no ritmo das ultimas 24 horas`,
       since: now,
     });
   }
@@ -351,10 +429,10 @@ export async function buildOverview(): Promise<OverviewPayload> {
   const localChart = fleetSeries(24, 10);
   const chart = localChart.length >= 6
     ? localChart.map((p) => ({ t: p.t, h: p.h, reject: p.reject }))
-    : (await viabtc.chart('min', 144).catch(() => [])).map((p) => ({
-        t: p.timestamp * 1000,
-        h: toTh(p.hashrate),
-        reject: num(p.reject_rate),
+    : (await lerGrafico(settings, 'min', 24).catch(() => [])).map((p) => ({
+        t: p.ts,
+        h: p.th,
+        reject: p.rejectPct,
       }));
 
   // Meses ja faturados usam a conta real; o resto segue o contrato configurado.
@@ -378,10 +456,15 @@ export async function buildOverview(): Promise<OverviewPayload> {
     miners: miners.sort((a, b) => a.worker.localeCompare(b.worker)),
     alerts,
     market,
+    poolBlocks: {
+      recentes: blocosRecentes(poolPrincipal(settings).mempoolSlug, 12),
+      stats: await estatisticasDaPool(poolPrincipal(settings).mempoolSlug),
+    },
     chart,
     revenueHistory,
     settings,
     poolStatus: { ok: status.ok, message: status.message, lastSuccess: status.lastSuccess },
+    pools: { escolha: settings.pool, rotulo: rotuloFonte(settings), disponiveis: poolsDisponiveis(), modos },
     generatedAt: now,
   };
 }

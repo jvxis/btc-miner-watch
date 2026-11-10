@@ -34,6 +34,18 @@ export function hashrateRef(amostras: number[], fallback: number): number {
  * Sobra o que da para defender: tempo desde o ultimo share, no limite que o
  * dono configurou, ou hashrate zerado.
  */
+/**
+ * Acima disto sem enviar share, a maquina deixa de ser cadencia e vira
+ * candidata a parada.
+ *
+ * Mora aqui, e nao no modulo de banco, porque quem conta o tempo de
+ * desempenho abaixo do nominal precisa do mesmo numero: o credito declara a
+ * fazenda parada aos oito minutos, e se o contador de desempenho so parasse
+ * aos quinze, os sete minutos do meio entrariam nas duas contas — justamente
+ * o que o extrato de energia garante que nao acontece.
+ */
+export const GRACE_SEM_SHARE_MS = 8 * 60_000;
+
 export function isOffline(
   settings: Settings,
   row: { lastActive: number; h10m: number },
@@ -46,10 +58,10 @@ export function isOffline(
  * Abaixo de quanto hashrate a maquina, e a fazenda, estao de fato paradas.
  *
  * E a segunda evidencia de parada: o intervalo sem share diz quando, isto diz
- * se. A margem e larga de proposito: maquina parada vai a zero, e mesmo uma
+ * se. A margem e larga de proposito — maquina parada vai a zero, e mesmo uma
  * maquina bem degradada costuma ficar acima de um terco do nominal, entao 25%
- * nao confunde uma com a outra. Para a fazenda, metade do nominal somado —
- * uma queda geral real leva a conta a quase zero em minutos.
+ * nao confunde uma com a outra. Para a fazenda, metade do nominal somado: uma
+ * queda geral real leva a conta a quase zero em minutos.
  */
 export function pisosDeParada(settings: Settings): { maquinaTh: number; fazendaTh: number } {
   const ativas = settings.miners.filter((m) => m.enabled && m.nominalTh > 0);

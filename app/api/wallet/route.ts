@@ -2,8 +2,8 @@ import { NextResponse } from 'next/server';
 import { payments, profitDays } from '@/lib/db';
 import { dailyCostResolver } from '@/lib/energy';
 import { fetchMarket } from '@/lib/market';
+import { modosAtivos, poolPrincipal, poolsAtivas, poolsConfiguradas, type PoolAccount } from '@/lib/pools';
 import { getSettings, minerCost } from '@/lib/settings';
-import { num, viabtc } from '@/lib/viabtc';
 
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
@@ -24,36 +24,40 @@ export async function GET(req: Request) {
   const daysLimit = limitParam(url, 'days', 90, 3650);
   const paymentsLimit = limitParam(url, 'payments', 60, 5000);
   try {
-    const [account, summary, market] = await Promise.all([
-      viabtc.account(),
-      viabtc.profitSummary().catch(() => null),
+    const settings = getSettings();
+    // Saldo de toda pool com chave: depois da troca, o que sobrou na antiga
+    // continua sendo dinheiro da fazenda ate ser pago.
+    const pools = poolsConfiguradas();
+    const comChave = pools.length > 0 ? pools : poolsAtivas(settings);
+    const [contas, resumos, market] = await Promise.all([
+      Promise.all(comChave.map((p) => p.account().catch((e: Error) => e))),
+      Promise.all(comChave.map((p) => p.profitSummary().catch(() => null))),
       fetchMarket(),
     ]);
 
-    // Se o banco ainda esta vazio, busca direto da pool.
+    const lidas = contas.filter((c): c is PoolAccount => !(c instanceof Error));
+    if (lidas.length === 0) throw contas[0] instanceof Error ? contas[0] : new Error('Nenhuma pool respondeu');
+    const principal = lidas.find((c) => c.pool === poolPrincipal(settings).id) ?? lidas[0];
+
     let days = profitDays(daysLimit);
     if (days.length === 0) {
-      days = (await viabtc.profitHistory(90).catch(() => [])).map((p) => ({
-        date: p.date,
-        total: num(p.total_profit),
-        pps: num(p.pps_profit),
-        pplns: num(p.pplns_profit),
-        solo: num(p.solo_profit),
-      }));
+      // Banco ainda vazio: busca direto da pool.
+      days = await poolPrincipal(settings).profitHistory(90).catch(() => []);
     }
     let pays = payments(paymentsLimit);
     if (pays.length === 0) {
-      pays = (await viabtc.paymentHistory(60).catch(() => [])).map((p) => ({
-        id: p.id,
-        amount: num(p.amount),
-        address: p.address,
-        tx: p.tx,
-        create_time: p.create_time * 1000,
+      const p = poolPrincipal(settings);
+      pays = (await p.paymentHistory(60).catch(() => [])).map((x) => ({
+        pool: p.id,
+        id: x.id,
+        amount: x.amount,
+        address: x.address,
+        tx: x.tx,
+        create_time: x.createdAt,
       }));
     }
 
     // Custo diario previsto pelo contrato, usado nos meses sem conta lancada.
-    const settings = getSettings();
     const contractDayBrl =
       settings.miners
         .filter((m) => m.enabled)
@@ -66,23 +70,30 @@ export async function GET(req: Request) {
       return { ...d, costBrl: c.costBrl, costSats: c.costSats, costReal: c.real };
     });
 
+    const somados = resumos.filter((r) => r !== null);
     return NextResponse.json(
       {
         account: {
-          name: account.account.account,
-          email: account.account.email,
-          createdAt: account.account.create_time * 1000,
-          addresses: account.withdraw_address,
+          pool: principal.pool,
+          name: principal.name,
+          email: principal.email,
+          createdAt: principal.createdAt,
+          addresses: principal.addresses,
         },
-        balances: account.balance.map((b) => ({ coin: b.coin, amount: num(b.amount) })),
-        summary: summary
-          ? {
-              total: num(summary.total_profit),
-              pps: num(summary.pps_profit),
-              pplns: num(summary.pplns_profit),
-              solo: num(summary.solo_profit),
-            }
-          : null,
+        // Uma linha por pool, para a tela mostrar onde esta cada saldo.
+        accounts: lidas.map((c) => ({ pool: c.pool, name: c.name, balanceBtc: c.balanceBtc })),
+        // O que a pool pagou no ultimo dia fechado diz o modo; a API nao tem campo para isso.
+        modos: modosAtivos(settings),
+        balances: [{ coin: 'BTC', amount: lidas.reduce((s, c) => s + c.balanceBtc, 0) }],
+        summary:
+          somados.length > 0
+            ? {
+                total: somados.reduce((s, r) => s + r.total, 0),
+                pps: somados.reduce((s, r) => s + r.pps, 0),
+                pplns: somados.reduce((s, r) => s + r.pplns, 0),
+                solo: somados.reduce((s, r) => s + r.solo, 0),
+              }
+            : null,
         days: daysWithCost,
         contractDayBrl,
         payments: pays,

@@ -17,7 +17,7 @@ const vt = VT323({
 
 export const metadata: Metadata = {
   title: 'MINER-WATCH · Terminal de Monitoracao',
-  description: 'Monitoracao da fazenda de mineracao Bitcoin na pool ViaBTC',
+  description: 'Monitoracao da fazenda de mineracao Bitcoin (ViaBTC ou AntPool)',
 };
 
 export const viewport: Viewport = {

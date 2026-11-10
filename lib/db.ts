@@ -1,6 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname, isAbsolute, join } from 'node:path';
+import { GRACE_SEM_SHARE_MS } from './health';
 
 /**
  * Banco local em SQLite (modulo nativo do Node 24, sem dependencia externa).
@@ -13,7 +14,10 @@ const globalRef = globalThis as unknown as { __minerWatchDb?: DatabaseSync };
 
 function resolveDbPath(): string {
   const raw = process.env.DB_PATH || 'data/miner-watch.db';
-  return isAbsolute(raw) ? raw : join(process.cwd(), raw);
+  // O rastreador do Next ve join(process.cwd(), ...) e conclui que o build
+  // depende do projeto inteiro: ele tracava tudo e avisava. O caminho so e
+  // resolvido em tempo de execucao; nada daqui precisa entrar no bundle.
+  return isAbsolute(raw) ? raw : join(/*turbopackIgnore: true*/ process.cwd(), raw);
 }
 
 export function db(): DatabaseSync {
@@ -60,12 +64,27 @@ export function db(): DatabaseSync {
       solo   REAL NOT NULL
     );
 
+    -- Ganho diario de cada pool. profit_days guarda a soma, que e o que o resto
+    -- do app le: no dia da troca de pool as duas pagam um pedaco do mesmo dia.
+    CREATE TABLE IF NOT EXISTS profit_days_pool (
+      pool   TEXT NOT NULL,
+      date   TEXT NOT NULL,
+      total  REAL NOT NULL,
+      pps    REAL NOT NULL,
+      pplns  REAL NOT NULL,
+      solo   REAL NOT NULL,
+      PRIMARY KEY (pool, date)
+    );
+
+    -- A chave inclui a pool: o id e de cada uma e pode se repetir entre elas.
     CREATE TABLE IF NOT EXISTS payments (
-      id          INTEGER PRIMARY KEY,
+      pool        TEXT    NOT NULL DEFAULT 'viabtc',
+      id          INTEGER NOT NULL,
       amount      REAL NOT NULL,
       address     TEXT,
       tx          TEXT,
-      create_time INTEGER NOT NULL
+      create_time INTEGER NOT NULL,
+      PRIMARY KEY (pool, id)
     );
 
     -- Conta de energia efetivamente paga, em satoshis, por mes de competencia.
@@ -160,6 +179,29 @@ export function db(): DatabaseSync {
     );
     CREATE INDEX IF NOT EXISTS idx_fleet_low_month ON fleet_low_events(month);
 
+    -- Blocos encontrados pela pool. A ViaBTC nao os publica; vem do indice
+    -- por pool do mempool.space, que identifica a origem pelo coinbase.
+    CREATE TABLE IF NOT EXISTS pool_blocks (
+      height      INTEGER PRIMARY KEY,
+      ts          INTEGER NOT NULL,
+      reward_sats INTEGER NOT NULL,
+      fees_sats   INTEGER NOT NULL,
+      tx_count    INTEGER NOT NULL,
+      notified_at INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_pool_blocks_ts ON pool_blocks(ts);
+
+    -- Peso de cada maquina em cada dia: a soma das leituras de 10 minutos.
+    -- Os snapshots sao podados aos 45 dias e, sem isto, o rateio da receita
+    -- por maquina voltava a ser por cabeca para todo dia mais antigo.
+    CREATE TABLE IF NOT EXISTS worker_daily_weight (
+      date     TEXT    NOT NULL,
+      worker   TEXT    NOT NULL,
+      peso     REAL    NOT NULL,
+      amostras INTEGER NOT NULL,
+      PRIMARY KEY (date, worker)
+    );
+
     CREATE TABLE IF NOT EXISTS miner_health (
       worker         TEXT PRIMARY KEY,
       degraded_since INTEGER
@@ -209,6 +251,41 @@ export function db(): DatabaseSync {
     conn.exec('ALTER TABLE energy_bills ADD COLUMN credit_applied_month TEXT');
   }
 
+  // Migracao: ate a AntPool, tudo veio da ViaBTC e nada registrava a pool.
+  // O historico diario antigo so existe aqui — a ViaBTC guarda uns 30 dias —
+  // entao ele entra na tabela por pool em nome dela antes de qualquer soma.
+  const porPool = conn.prepare('SELECT 1 AS x FROM profit_days_pool LIMIT 1').get();
+  if (porPool === undefined) {
+    conn.exec(
+      `INSERT INTO profit_days_pool (pool, date, total, pps, pplns, solo)
+       SELECT 'viabtc', date, total, pps, pplns, solo FROM profit_days`,
+    );
+  }
+  const pagCols = conn.prepare('PRAGMA table_info(payments)').all() as { name: string }[];
+  if (!pagCols.some((c) => c.name === 'pool')) {
+    conn.exec(`
+      BEGIN;
+      CREATE TABLE payments_novo (
+        pool        TEXT    NOT NULL DEFAULT 'viabtc',
+        id          INTEGER NOT NULL,
+        amount      REAL NOT NULL,
+        address     TEXT,
+        tx          TEXT,
+        create_time INTEGER NOT NULL,
+        PRIMARY KEY (pool, id)
+      );
+      INSERT INTO payments_novo (pool, id, amount, address, tx, create_time)
+        SELECT 'viabtc', id, amount, address, tx, create_time FROM payments;
+      DROP TABLE payments;
+      ALTER TABLE payments_novo RENAME TO payments;
+      COMMIT;
+    `);
+  }
+  const blocoCols = conn.prepare('PRAGMA table_info(pool_blocks)').all() as { name: string }[];
+  if (!blocoCols.some((c) => c.name === 'pool')) {
+    conn.exec(`ALTER TABLE pool_blocks ADD COLUMN pool TEXT NOT NULL DEFAULT 'viabtc'`);
+  }
+
   globalRef.__minerWatchDb = conn;
   return conn;
 }
@@ -237,7 +314,8 @@ export function kvSet(key: string, value: unknown): void {
 
 export interface SnapshotRow {
   worker: string;
-  workerId: number;
+  /** id da maquina na pool — numero na ViaBTC, nome completo na AntPool */
+  workerId: string;
   h10m: number;
   h1h: number;
   reject: number;
@@ -284,21 +362,50 @@ export function writeFleetSnapshot(
     .run(ts, v.h10m, v.h1h, v.active, v.inactive, v.reject, v.btcUsd ?? null, v.btcBrl ?? null);
 }
 
-export function upsertProfitDays(days: { date: string; total: number; pps: number; pplns: number; solo: number }[]): void {
-  const stmt = db().prepare(
-    `INSERT INTO profit_days (date, total, pps, pplns, solo) VALUES (?, ?, ?, ?, ?)
+/**
+ * Grava o ganho diario de uma pool e refaz a soma do dia.
+ *
+ * O dia que a pool nao devolve mais (passou da janela dela) fica como estava:
+ * a soma so e refeita para as datas que chegaram agora.
+ */
+export function upsertProfitDays(
+  pool: string,
+  days: { date: string; total: number; pps: number; pplns: number; solo: number }[],
+): void {
+  const conn = db();
+  const porPool = conn.prepare(
+    `INSERT INTO profit_days_pool (pool, date, total, pps, pplns, solo) VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(pool, date) DO UPDATE SET total = excluded.total, pps = excluded.pps,
+       pplns = excluded.pplns, solo = excluded.solo`,
+  );
+  const soma = conn.prepare(
+    `INSERT INTO profit_days (date, total, pps, pplns, solo)
+     SELECT date, SUM(total), SUM(pps), SUM(pplns), SUM(solo) FROM profit_days_pool WHERE date = ? GROUP BY date
      ON CONFLICT(date) DO UPDATE SET total = excluded.total, pps = excluded.pps,
        pplns = excluded.pplns, solo = excluded.solo`,
   );
-  for (const d of days) stmt.run(d.date, d.total, d.pps, d.pplns, d.solo);
+  conn.exec('BEGIN');
+  try {
+    for (const d of days) {
+      porPool.run(pool, d.date, d.total, d.pps, d.pplns, d.solo);
+      soma.run(d.date);
+    }
+    conn.exec('COMMIT');
+  } catch (e) {
+    conn.exec('ROLLBACK');
+    throw e;
+  }
 }
 
-export function upsertPayments(rows: { id: number; amount: number; address: string; tx: string; create_time: number }[]): void {
+export function upsertPayments(
+  pool: string,
+  rows: { id: number; amount: number; address: string; tx: string; create_time: number }[],
+): void {
   const stmt = db().prepare(
-    `INSERT INTO payments (id, amount, address, tx, create_time) VALUES (?, ?, ?, ?, ?)
-     ON CONFLICT(id) DO NOTHING`,
+    `INSERT INTO payments (pool, id, amount, address, tx, create_time) VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(pool, id) DO NOTHING`,
   );
-  for (const r of rows) stmt.run(r.id, r.amount, r.address, r.tx, r.create_time);
+  for (const r of rows) stmt.run(pool, r.id, r.amount, r.address, r.tx, r.create_time);
 }
 
 export function logEvent(level: string, kind: string, worker: string | null, detail: string): void {
@@ -313,19 +420,29 @@ export function logEvent(level: string, kind: string, worker: string | null, det
 
 // ------------------------------------------------------------------ leitura
 
-/** Media do hashrate 10min por maquina numa janela (horas), em TH/s. */
-export function avgHashrateByWorker(hours: number): Map<string, { avg: number; samples: number; online: number }> {
+/**
+ * Media do hashrate 10min por maquina numa janela (horas), em TH/s.
+ *
+ * `produzindo` e a media so das leituras com hashrate: o ritmo da maquina
+ * quando esta ligada, sem as paradas. Fica nula se ela nao produziu na janela.
+ */
+export function avgHashrateByWorker(
+  hours: number,
+): Map<string, { avg: number; samples: number; online: number; produzindo: number | null }> {
   const since = Date.now() - hours * 3600_000;
   const rows = db()
     .prepare(
       `SELECT worker,
               AVG(hashrate_10m) AS avg,
               COUNT(*) AS samples,
-              SUM(CASE WHEN hashrate_10m > 0 THEN 1 ELSE 0 END) AS online
+              SUM(CASE WHEN hashrate_10m > 0 THEN 1 ELSE 0 END) AS online,
+              AVG(CASE WHEN hashrate_10m > 0 THEN hashrate_10m END) AS produzindo
        FROM snapshots WHERE ts >= ? GROUP BY worker`,
     )
-    .all(since) as { worker: string; avg: number; samples: number; online: number }[];
-  return new Map(rows.map((r) => [r.worker, { avg: r.avg, samples: r.samples, online: r.online }]));
+    .all(since) as { worker: string; avg: number; samples: number; online: number; produzindo: number | null }[];
+  return new Map(
+    rows.map((r) => [r.worker, { avg: r.avg, samples: r.samples, online: r.online, produzindo: r.produzindo }]),
+  );
 }
 
 /**
@@ -338,20 +455,81 @@ export function avgHashrateByWorker(hours: number): Map<string, { avg: number; s
  */
 export function dailyWorkerWeights(sinceDays: number): Map<string, Map<string, number>> {
   const since = Date.now() - sinceDays * 86_400_000;
-  const rows = db()
-    .prepare(
-      `SELECT strftime('%Y-%m-%d', ts / 1000, 'unixepoch', 'localtime') AS d,
-              worker, SUM(hashrate_10m) AS peso
-       FROM snapshots WHERE ts >= ? GROUP BY d, worker`,
-    )
-    .all(since) as { d: string; worker: string; peso: number }[];
-
+  const desde = new Date(since).toLocaleDateString('sv-SE');
   const out = new Map<string, Map<string, number>>();
-  for (const r of rows) {
+
+  const gravados = db()
+    .prepare('SELECT date AS d, worker, peso FROM worker_daily_weight WHERE date >= ?')
+    .all(desde) as { d: string; worker: string; peso: number }[];
+  for (const r of gravados) {
+    if (!out.has(r.d)) out.set(r.d, new Map());
+    out.get(r.d)!.set(r.worker, r.peso);
+  }
+
+  // Dias recentes que o coletor ainda nao gravou saem direto dos snapshots.
+  const diasGravados = new Set(gravados.map((g) => g.d));
+  for (const r of pesosDosSnapshots(Math.max(since, Date.now() - 3 * 86_400_000))) {
+    if (diasGravados.has(r.d)) continue;
     if (!out.has(r.d)) out.set(r.d, new Map());
     out.get(r.d)!.set(r.worker, r.peso);
   }
   return out;
+}
+
+/** Hashrate da conta em cada coleta do periodo, em ordem. */
+export function contaNoPeriodo(since: number, until: number): { ts: number; h: number }[] {
+  return db()
+    .prepare('SELECT ts, hashrate_10m AS h FROM fleet_snapshots WHERE ts >= ? AND ts < ? ORDER BY ts')
+    .all(since, until) as { ts: number; h: number }[];
+}
+
+/** Hashrate entregue por dia, em TH/s x hora, somando as maquinas. */
+export function entregaDiaria(desde: string, ate: string): Map<string, number> {
+  const rows = db()
+    .prepare(
+      `SELECT date, SUM(peso * 24.0 / amostras) AS thh
+       FROM worker_daily_weight WHERE date >= ? AND date <= ? AND amostras > 0 GROUP BY date`,
+    )
+    .all(desde, ate) as { date: string; thh: number }[];
+  return new Map(rows.map((r) => [r.date, r.thh]));
+}
+
+function pesosDosSnapshots(since: number): { d: string; worker: string; peso: number; amostras: number }[] {
+  return db()
+    .prepare(
+      `SELECT strftime('%Y-%m-%d', ts / 1000, 'unixepoch', 'localtime') AS d,
+              worker, SUM(hashrate_10m) AS peso, COUNT(*) AS amostras
+       FROM snapshots WHERE ts >= ? GROUP BY d, worker`,
+    )
+    .all(since) as { d: string; worker: string; peso: number; amostras: number }[];
+}
+
+/**
+ * Grava o peso diario de cada maquina a partir dos snapshots.
+ *
+ * So substitui o que ja esta gravado quando a leitura nova tem pelo menos
+ * tantas amostras quanto a antiga: o dia mais velho dos snapshots e cortado
+ * no meio pela poda, e recalcula-lo trocaria um dia inteiro por um pedaco.
+ * O dia de hoje fica de fora porque ainda nao terminou.
+ */
+export function persistirPesosDiarios(sinceDays: number): number {
+  const conn = db();
+  const hoje = new Date().toLocaleDateString('sv-SE');
+  const linhas = pesosDosSnapshots(Date.now() - sinceDays * 86_400_000).filter((r) => r.d < hoje);
+  const stmt = conn.prepare(
+    `INSERT INTO worker_daily_weight (date, worker, peso, amostras) VALUES (?, ?, ?, ?)
+     ON CONFLICT(date, worker) DO UPDATE SET peso = excluded.peso, amostras = excluded.amostras
+     WHERE excluded.amostras >= worker_daily_weight.amostras`,
+  );
+  conn.exec('BEGIN');
+  try {
+    for (const r of linhas) stmt.run(r.d, r.worker, r.peso, r.amostras);
+    conn.exec('COMMIT');
+  } catch (e) {
+    conn.exec('ROLLBACK');
+    throw e;
+  }
+  return linhas.length;
 }
 
 /** Cotacao media do BTC em cada dia observado, em BRL. */
@@ -399,6 +577,18 @@ export function fleetAverage(hours: number): { avg: number; days: number } | nul
 
   if (!r || r.avg === null || r.n < 60 || r.primeiro === null) return null;
   return { avg: r.avg, days: (Date.now() - r.primeiro) / 86_400_000 };
+}
+
+/**
+ * Serie horaria da conta importada da pool, desde um instante.
+ *
+ * E a unica fonte que alcanca o inicio da operacao: os snapshots locais sao
+ * podados aos 45 dias, a serie da pool nao.
+ */
+export function poolHourly(since: number): { ts: number; hashrate: number }[] {
+  return db()
+    .prepare("SELECT ts, hashrate FROM pool_chart WHERE interval = 'hour' AND ts >= ? ORDER BY ts")
+    .all(since) as { ts: number; hashrate: number }[];
 }
 
 export function fleetSeries(hours: number, bucketMinutes = 10): { t: number; h: number; h1h: number; active: number; reject: number }[] {
@@ -459,10 +649,22 @@ export function profitDays(limit = 90): { date: string; total: number; pps: numb
     .all(limit) as { date: string; total: number; pps: number; pplns: number; solo: number }[];
 }
 
-export function payments(limit = 60): { id: number; amount: number; address: string; tx: string; create_time: number }[] {
+/**
+ * Todos os dias pagos de uma pool, para saber o modo de pagamento de cada uma.
+ * Sem limite: cortar o historico faria o modo parecer mais novo do que e.
+ */
+export function profitDaysDaPool(pool: string): { date: string; pps: number; pplns: number; solo: number }[] {
   return db()
-    .prepare('SELECT id, amount, address, tx, create_time FROM payments ORDER BY create_time DESC LIMIT ?')
-    .all(limit) as { id: number; amount: number; address: string; tx: string; create_time: number }[];
+    .prepare('SELECT date, pps, pplns, solo FROM profit_days_pool WHERE pool = ? ORDER BY date DESC')
+    .all(pool) as { date: string; pps: number; pplns: number; solo: number }[];
+}
+
+export function payments(
+  limit = 60,
+): { pool: string; id: number; amount: number; address: string; tx: string; create_time: number }[] {
+  return db()
+    .prepare('SELECT pool, id, amount, address, tx, create_time FROM payments ORDER BY create_time DESC LIMIT ?')
+    .all(limit) as { pool: string; id: number; amount: number; address: string; tx: string; create_time: number }[];
 }
 
 // ------------------------------------------------------------------ contas de energia
@@ -583,7 +785,7 @@ export interface WorkerDowntime {
  */
 const REPORT_MS = 5 * 60_000;
 /** Acima disso o intervalo sem share deixa de ser cadencia e vira parada. */
-const GRACE_MS = 8 * 60_000;
+const GRACE_MS = GRACE_SEM_SHARE_MS;
 /** Coletas mais espacadas que isso sao lacuna nossa, nao parada da maquina. */
 const MAX_GAP_MS = 10 * 60_000;
 
@@ -596,14 +798,22 @@ const MAX_GAP_MS = 10 * 60_000;
  * dias seguidos. Com um limite calibrado para a cadencia antiga, todas as
  * maquinas parecem paradas ao mesmo tempo nos minutos antes de cada
  * atualizacao, e o mes enche de "quedas totais" de 1 a 2 minutos enquanto o
- * hashrate da conta nao se move. Ajustar os limites a cadencia medida so
- * troca uma suposicao por outra — a pool volta a mudar.
+ * hashrate da conta nao se move — o credito de parada sai varias vezes maior
+ * que o real. Ajustar os limites a cadencia so troca uma suposicao por outra.
  *
  * O hashrate diz SE ela parou. Nao serve para marcar o inicio — a media de 10
  * minutos decai devagar — mas nao mente sobre o fato: maquina parada vai a
  * zero, atraso de publicacao nao mexe nele. Entao um intervalo sem share so
  * vira parada quando o hashrate confirma.
  */
+export interface PoolBlockRow {
+  height: number;
+  ts: number;
+  rewardSats: number;
+  feesSats: number;
+  txCount: number;
+}
+
 export interface PisosParada {
   /** abaixo disto, em TH/s, a maquina esta de fato sem produzir */
   maquinaTh: number;
@@ -693,9 +903,17 @@ export function upsertChart(
   interval: 'min' | 'hour' | 'day',
   points: { ts: number; hashrate: number; reject: number }[],
 ): void {
+  // Zero nao apaga producao ja gravada. Na troca de pool, a nova devolve zeros
+  // para as horas anteriores a chegada das maquinas — que foram produzidas na
+  // pool antiga. Sobrescrever viraria queda total falsa no relatorio.
+  // Queda de verdade nao e afetada: um ponto de 10 minutos so termina em zero
+  // se a pool nunca viu share nele, e entao nunca foi gravado com producao.
   const stmt = db().prepare(
     `INSERT INTO pool_chart (ts, interval, hashrate, reject) VALUES (?, ?, ?, ?)
-     ON CONFLICT(ts, interval) DO UPDATE SET hashrate = excluded.hashrate, reject = excluded.reject`,
+     ON CONFLICT(ts, interval) DO UPDATE SET
+       hashrate = CASE WHEN excluded.hashrate <= 0 AND pool_chart.hashrate > 0
+                       THEN pool_chart.hashrate ELSE excluded.hashrate END,
+       reject = excluded.reject`,
   );
   for (const p of points) stmt.run(p.ts, interval, p.hashrate, p.reject);
 }
@@ -904,6 +1122,73 @@ export function fazendaBaixaDoMes(month: string): FleetLowMonth {
     perdaPorWorker: new Map(perdas.map((r) => [r.worker, r.lost_ms])),
     eventos: eventos.map((r) => ({ from: r.from_ts, to: r.to_ts, belowMs: r.below_ms, minPct: r.min_pct })),
   };
+}
+
+/**
+ * Grava os blocos que ainda nao conheciamos.
+ *
+ * `jaAvisado` serve a primeira sincronizacao: a API devolve os ultimos cem
+ * blocos de uma vez, e avisar sobre bloco de uma semana atras seria barulho.
+ * Bloco ja gravado nao e tocado — o carimbo de aviso dele nao pode voltar.
+ */
+export function registrarBlocos(pool: string, blocos: PoolBlockRow[], jaAvisado: boolean): void {
+  const conn = db();
+  const stmt = conn.prepare(
+    `INSERT INTO pool_blocks (pool, height, ts, reward_sats, fees_sats, tx_count, notified_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(height) DO NOTHING`,
+  );
+  const carimbo = jaAvisado ? Date.now() : null;
+  conn.exec('BEGIN');
+  try {
+    for (const b of blocos) stmt.run(pool, b.height, b.ts, b.rewardSats, b.feesSats, b.txCount, carimbo);
+    conn.exec('COMMIT');
+  } catch (e) {
+    conn.exec('ROLLBACK');
+    throw e;
+  }
+}
+
+/** Blocos gravados que ainda nao foram avisados, do mais antigo ao mais novo. */
+export function blocosNovos(pool: string): PoolBlockRow[] {
+  return db()
+    .prepare(
+      `SELECT height, ts, reward_sats AS rewardSats, fees_sats AS feesSats, tx_count AS txCount
+       FROM pool_blocks WHERE pool = ? AND notified_at IS NULL ORDER BY height`,
+    )
+    .all(pool) as unknown as PoolBlockRow[];
+}
+
+export function marcarBlocosAvisados(alturas: number[]): void {
+  if (alturas.length === 0) return;
+  const conn = db();
+  const stmt = conn.prepare('UPDATE pool_blocks SET notified_at = ? WHERE height = ?');
+  const agora = Date.now();
+  conn.exec('BEGIN');
+  try {
+    for (const h of alturas) stmt.run(agora, h);
+    conn.exec('COMMIT');
+  } catch (e) {
+    conn.exec('ROLLBACK');
+    throw e;
+  }
+}
+
+export function poolBlocks(pool: string, limite: number): PoolBlockRow[] {
+  return db()
+    .prepare(
+      `SELECT height, ts, reward_sats AS rewardSats, fees_sats AS feesSats, tx_count AS txCount
+       FROM pool_blocks WHERE pool = ? ORDER BY height DESC LIMIT ?`,
+    )
+    .all(pool, limite) as unknown as PoolBlockRow[];
+}
+
+/** Ha blocos gravados desta pool? Decide se a proxima sincronizacao e a primeira. */
+export function temBlocos(pool: string): boolean {
+  const r = db().prepare('SELECT 1 AS x FROM pool_blocks WHERE pool = ? LIMIT 1').get(pool) as
+    | { x: number }
+    | undefined;
+  return r !== undefined;
 }
 
 export function persistedOutage(month: string): { downMs: number; observedFrom: number | null } | null {

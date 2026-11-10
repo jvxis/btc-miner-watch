@@ -99,8 +99,16 @@ export function useMiner(worker: string, hours: number) {
   });
 }
 
+/**
+ * A carteira nao recarregava: sem intervalo e sem revalidar no foco, os
+ * numeros ficavam congelados no instante em que a pagina abriu — o contador de
+ * fazenda abaixo da faixa parecia travado enquanto subia no servidor.
+ *
+ * Os formularios sao estado local do React, entao atualizar os dados nao
+ * atrapalha quem esta digitando um lancamento.
+ */
 export function useEnergyBills() {
-  return useSWR('/api/energy-bills', fetcher, { revalidateOnFocus: false, keepPreviousData: true });
+  return useSWR('/api/energy-bills', fetcher, { refreshInterval: 60_000, keepPreviousData: true });
 }
 
 export function useEvents() {

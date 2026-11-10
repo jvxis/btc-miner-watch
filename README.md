@@ -1,7 +1,7 @@
 # BTC MINER WATCH
 
-Painel de monitoração para fazendas de mineração Bitcoin na pool **ViaBTC**, com
-estética de terminal CRT de fósforo. Desktop e mobile.
+Painel de monitoração para fazendas de mineração Bitcoin nas pools **ViaBTC** e
+**AntPool**, com estética de terminal CRT de fósforo. Desktop e mobile.
 
 Acompanha cada máquina individualmente, o custo de energia, a receita paga pela
 pool e o resultado da operação — tudo apurado em satoshis, com leitura em BRL e
@@ -31,8 +31,23 @@ no fim deste documento. Este projeto contorna todas elas com um coletor local.
 - **P&L** por competência, em satoshis, com o preço efetivo da energia por kWh
 - **Cobrança adiantada**: prévia do mês seguinte já com o desconto das paradas
   do mês corrente, pronta para enviar ao fornecedor
-- **Payback por máquina**: preço pago, quanto já voltou em satoshis e a
-  previsão de quitação no ritmo atual
+- **Payback por máquina**: preço pago, quanto já voltou em satoshis (rateado
+  dia a dia pelo hashrate que cada máquina entregou) e a previsão de quitação
+- **Lucro projetado estável**: receita, lucro e payback valem o ritmo das
+  últimas 24 horas de cada máquina produzindo, então uma parada curta não faz a
+  fazenda parecer no prejuízo depois que volta; máquina parada conta zero
+- **Duas pools**: ViaBTC, AntPool ou as duas somadas durante uma migração,
+  escolhidas na tela de configurações; workers que a pool lista mas não são
+  máquinas da fazenda podem ser ignorados
+- **Modo de pagamento detectado** (PPS+, PPLNS, SOLO ou misto) a partir do que a
+  pool pagou, com a janela de rendimento ajustada ao modo — 7 dias por share,
+  14 quando a receita depende de bloco
+- **Produção perdida**: o que a conta deixou de receber por paradas e por
+  desempenho abaixo do nominal, ao lado do crédito de energia; o abatimento por
+  desempenho entra como fração combinada com o fornecedor (50% por padrão)
+- **Fatura em planilha**: extrato da competência em `.xlsx`, gerado pelo app
+- **Média desde o início** da operação, contra o nominal de cada momento
+- **Blocos da pool** na aba Rede, com aviso opcional no Telegram
 - **Avisos no Telegram** em três níveis — crítico (máquina parada, fazenda
   parada, falha na pool), degradação prolongada e problema crônico
 - **Simulador** de preço do BTC, tarifa e dificuldade
@@ -45,7 +60,7 @@ compilação.
 
 ```bash
 npm install
-cp .env.example .env.local     # preencha a chave da ViaBTC
+cp .env.example .env.local     # preencha a chave da pool que voce usa
 npm run dev                    # http://localhost:3000
 npm run dev:lan                # acessível na rede local
 ```
@@ -71,13 +86,17 @@ de quedas e gráficos de alta resolução.
 | `VIABTC_SECRET_KEY` | usada nos endpoints que exigem assinatura HMAC |
 | `VIABTC_BASE_URL` | `https://www.viabtc.net` |
 | `VIABTC_COIN` | `BTC` |
+| `ANTPOOL_API_KEY` / `ANTPOOL_API_SECRET` | chave da API da AntPool, criada em `antpool.com/userApi` |
+| `ANTPOOL_USER_ID` | nome da conta ou subconta, o mesmo prefixo dos workers |
+| `ANTPOOL_TIME_OFFSET` | opcional; fuso das datas em texto da AntPool, se o último share sair deslocado |
 | `POLL_INTERVAL_SECONDS` | intervalo do coletor, mínimo 30 |
 | `DB_PATH` | caminho do banco SQLite |
 
 > **Whitelist de IP**: a ViaBTC só responde a chamadas vindas de IPs liberados na
 > página de configurações de mineração. Sem isso a API retorna erro `12004`.
 
-Tarifa de energia, consumo em watts, hashrate nominal, apelidos e limites de
+Basta a chave das pools que você usa. A pool lida (ViaBTC, AntPool ou ambas),
+tarifa de energia, consumo em watts, hashrate nominal, apelidos e limites de
 alerta ficam na página de configurações, gravados no banco local.
 
 ### Avisos no Telegram
@@ -123,8 +142,13 @@ custa dinheiro justamente por não acordar ninguém.
 
 ```
 app/api/*        rotas internas — a chave da pool nunca chega ao navegador
-lib/viabtc.ts    cliente da ViaBTC, com assinatura HMAC e tradução de erros
+lib/pools/       uma interface comum e um cliente por pool (ViaBTC, AntPool),
+                 com assinatura HMAC, unidades normalizadas e detecção do modo
+                 de pagamento
 lib/db.ts        SQLite via node:sqlite, sem dependência externa
+lib/blocks.ts    blocos encontrados pela pool, identificados pelo mempool.space
+lib/energyReport.ts  competências de energia, crédito de parada, produção perdida
+lib/planilha.ts  extrato da fatura em .xlsx (exceljs)
 lib/poller.ts    coletor de snapshots e detecção de quedas
 lib/metrics.ts   motor de cálculo: energia, receita, lucro, saúde, alertas
 lib/health.ts    critérios de parada e degradação, um só para coletor e tela
@@ -138,7 +162,7 @@ lib/market.ts    preço (CoinGecko) e rede (mempool.space), com cache e fallback
 Descobertas medindo em produção. Nenhuma está na documentação oficial.
 
 **Os campos de 24h por máquina são inconsistentes.** Numa mesma leitura, uma
-máquina reporta 837 TH/s enquanto outras reportam 26 TH/s. E o histórico diário
+máquina pode reportar dezenas de vezes o hashrate das outras. E o histórico diário
 por worker devolve o hashrate da conta inteira, não o da máquina. Apenas
 `hashrate_10min` e `hashrate_1hour` são confiáveis — as médias de 24h, o uptime
 e os gráficos por máquina saem dos snapshots locais.
@@ -172,7 +196,19 @@ descartado — a pool volta a mudar, e o hashrate é a única verdade independen
 **A média de 1 hora demora até 60 minutos para se limpar depois de uma queda.**
 Usá-la para status manteria a fazenda inteira marcada como degradada por quase
 uma hora depois de já ter voltado. O status usa a mediana das leituras recentes
-de 10 minutos, que reage em minutos sem tremer com o ruído.
+de 10 minutos, que reage em minutos sem tremer com o ruído. Pelo mesmo motivo, o
+lucro projetado não usa a média de 1 hora, e sim o ritmo de 24 horas de cada
+máquina produzindo.
+
+**Não há campo com o modo de pagamento.** Nem a conta nem o resumo de receita
+dizem se a conta está em PPS+, PPLNS ou SOLO. O app deduz pelas colunas do
+histórico diário de receita: o dia em que a maior parte veio de uma delas.
+Depois de uma troca, o dia fechado ainda mostra o modo antigo; em PPLNS, a pool
+publica também a linha do dia corrente, que ainda cresce.
+
+**Em PPLNS e SOLO, a receita diária depende de bloco.** Ela oscila bem mais de
+um dia para o outro sem que o hashrate tenha mudado, então o rendimento por
+TH/dia usa uma janela de 14 dias, em vez de 7.
 
 ## Deploy
 

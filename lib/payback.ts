@@ -8,8 +8,10 @@ import type { MinerConfig, Settings } from './types';
  * Tres fontes, em ordem de fidelidade, porque nenhuma sozinha cobre a
  * operacao inteira:
  *
- * 1. Onde ha snapshot local, a receita do dia e rateada pelo hashrate que
- *    cada maquina entregou naquele dia. E o rateio fiel.
+ * 1. Onde ha peso diario gravado (desde que o coletor
+ *    comecou), a receita do dia e rateada pelo hashrate que cada maquina
+ *    entregou naquele dia. E o rateio fiel, e nao se perde com a poda dos
+ *    snapshots: o peso fica em worker_daily_weight.
  * 2. Antes disso, a receita diaria da pool ainda existe, mas nao ha hashrate
  *    por maquina em lugar nenhum — a ViaBTC nao guarda. Divide-se entre as
  *    maquinas que ja estavam ligadas no dia.
@@ -47,6 +49,8 @@ export interface PaybackView {
 
 const DIA = 86_400_000;
 const dia = (t: number): string => new Date(t).toLocaleDateString('sv-SE');
+/** Quantos dias ate hoje, com folga, para as consultas cobrirem desde `t`. */
+const diasDesde = (t: number): number => Math.ceil((Date.now() - t) / DIA) + 2;
 
 /**
  * Custo de energia de um dia, na moeda em que o contrato existe.
@@ -80,11 +84,13 @@ function entrouEm(settings: Settings, m: MinerConfig): number | null {
  */
 function receitaPorDia(desde: number): Map<string, number> {
   const out = new Map<string, number>();
-  const diarios = profitDays(120);
+  // A operacao inteira, nao uma janela fixa: com o tempo, um teto de dias
+  // deixaria os primeiros meses de fora do retorno.
+  const diarios = profitDays(diasDesde(desde));
   for (const d of diarios) if (d.total > 0) out.set(d.date, d.total);
 
   const primeiroDiario = diarios.length ? diarios.map((d) => d.date).sort()[0] : null;
-  const pagos = payments(200)
+  const pagos = payments(5000)
     .filter((p) => p.amount > 0)
     .sort((a, b) => a.create_time - b.create_time);
 
@@ -122,13 +128,34 @@ export interface RetornoMedido {
 }
 
 /**
+ * O retorno muda devagar: e um acumulado de meses, e o unico dia que ainda se
+ * move e o de hoje — que nem entra na conta. Refazer a varredura de 120 dias a
+ * cada chamada custava quase cinco segundos de SQLite travado, a cada vinte
+ * segundos, porque o painel recarrega sozinho. Dez minutos de validade nao
+ * mudam um numero que leva meses para virar.
+ */
+const VALIDADE_MS = 10 * 60_000;
+let cache: { em: number; chave: string; valor: RetornoMedido } | null = null;
+
+/**
+ * Impressao digital da configuracao que entra no calculo.
+ * Guardar isto em vez de avisar o cache quando algo muda evita que settings.ts
+ * precise conhecer este modulo — seria importacao circular, ja que a conta
+ * daqui depende das regras de custo de la.
+ */
+const chaveDe = (s: Settings): string =>
+  JSON.stringify([s.miningStartedAt, s.costModel, s.fixedMonthlyUsdPerMiner, s.tariffBrl, s.tariffSurchargePct, s.miners]);
+
+/**
  * Soma, dia a dia, o que cada maquina rendeu menos o que custou.
  * O dia corrente fica de fora: a receita esta incompleta e o custo nao, o que
  * faria toda maquina parecer pior do que e.
  */
 export function retornoMedido(settings: Settings): RetornoMedido {
+  const chave = chaveDe(settings);
+  if (cache && cache.chave === chave && Date.now() - cache.em < VALIDADE_MS) return cache.valor;
   const inicio = settings.miningStartedAt ?? Date.now() - 60 * DIA;
-  const pesos = dailyWorkerWeights(120);
+  const pesos = dailyWorkerWeights(diasDesde(inicio));
   const receitas = receitaPorDia(inicio);
   const hoje = dia(Date.now());
 
@@ -171,7 +198,9 @@ export function retornoMedido(settings: Settings): RetornoMedido {
     }
   }
 
-  return { porWorker, dias: usados.length, desde: usados[0] ?? null, precisos, estimados };
+  const valor = { porWorker, dias: usados.length, desde: usados[0] ?? null, precisos, estimados };
+  cache = { em: Date.now(), chave, valor };
+  return valor;
 }
 
 /** Monta a visao de payback de uma maquina a partir do retorno ja medido. */

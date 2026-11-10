@@ -206,7 +206,8 @@ export default function MinerDetail({ params }: { params: Promise<{ worker: stri
               sub={`energia ${fmtMoney(m.payback.energyUsd, 'USD', true)} no periodo`}
             />
             <Stat
-              label="Ritmo atual"
+              label="Ritmo (24h)"
+              hint="Lucro no ritmo das ultimas 24 horas com a maquina produzindo"
               value={`${fmtMoney(m.payback.profitDayBrl, 'BRL', true)}/dia`}
               sub={`${fmtMoney(m.payback.profitDayBrl * 30, 'BRL', true)}/mes`}
               tone={m.payback.profitDayBrl < 0 ? 'crit' : 'normal'}
@@ -225,7 +226,7 @@ export default function MinerDetail({ params }: { params: Promise<{ worker: stri
                   ? 'o investimento ja voltou'
                   : m.payback.daysLeft === null
                     ? 'a maquina nao esta dando lucro'
-                    : `${Math.round(m.payback.daysLeft)} dias no ritmo de hoje`
+                    : `${Math.round(m.payback.daysLeft)} dias no ritmo das ultimas 24h`
               }
             />
           </div>
@@ -273,7 +274,11 @@ export default function MinerDetail({ params }: { params: Promise<{ worker: stri
       </Panel>
 
       <div className="grid gap-4 lg:grid-cols-2">
-        <Panel title="Historico diario da pool" right="dado bruto da ViaBTC" bodyClassName="p-0 overflow-x-auto">
+        <Panel
+          title="Historico diario da pool"
+          right={`dado bruto da ${data.poolLabel ?? 'pool'}`}
+          bodyClassName="p-0 overflow-x-auto"
+        >
           <table className="term">
             <thead>
               <tr>
@@ -283,17 +288,17 @@ export default function MinerDetail({ params }: { params: Promise<{ worker: stri
               </tr>
             </thead>
             <tbody>
-              {(data.poolDaily ?? []).slice(0, 14).map((d: { date: string; hashrate: string; reject_rate: string }) => (
+              {(data.poolDaily ?? []).slice(0, 14).map((d: { date: string; th: number; rejectPct: number | null }) => (
                 <tr key={d.date}>
                   <td>{d.date}</td>
-                  <td className="hot">{fmtHash(Number(d.hashrate) / 1e12)}</td>
-                  <td>{Number(d.reject_rate).toFixed(3)}%</td>
+                  <td className="hot">{fmtHash(d.th)}</td>
+                  <td>{d.rejectPct === null ? '—' : `${d.rejectPct.toFixed(3)}%`}</td>
                 </tr>
               ))}
             </tbody>
           </table>
           <p className="p-3 text-[0.62rem] dimmer">
-            A ViaBTC agrega este historico de forma inconsistente por maquina (valores muito acima do nominal). Use o
+            A pool agrega este historico do jeito dela — a ViaBTC chega a mostrar valores muito acima do nominal. Use o
             grafico acima, gerado pelo coletor local, como referencia real.
           </p>
         </Panel>
@@ -301,6 +306,7 @@ export default function MinerDetail({ params }: { params: Promise<{ worker: stri
         <Panel title="Ficha da maquina">
           <div className="space-y-0.5">
             <KeyValue k="Worker na pool" v={m.worker} />
+            <KeyValue k="Pool" v={data.poolLabel ?? m.pool} />
             <KeyValue k="ID" v={String(m.workerId)} />
             <KeyValue k="Local" v={m.location || '—'} />
             <KeyValue k="Status" v={m.status.toUpperCase()} tone={m.status === 'offline' ? 'crit' : m.status === 'degraded' ? 'warn' : undefined} />

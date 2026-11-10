@@ -16,7 +16,11 @@ import {
   fmtPct,
   fmtSats,
 } from '@/lib/format';
-import type { MediaJanela } from '@/lib/types';
+import { janelaDeReceita } from '@/lib/pools/modo';
+import type { MediaDesdeInicio, MediaJanela } from '@/lib/types';
+
+const RITMO_24H =
+  'Projecao no ritmo das ultimas 24 horas de cada maquina produzindo; maquina parada agora conta zero. Depois da volta, o numero se recupera na hora';
 
 /**
  * Media de janela longa, com a cobertura declarada quando ela nao fecha.
@@ -31,6 +35,16 @@ function mediaLonga(m: MediaJanela | null, janelaDias: number): string {
   return parcial ? `${fmtHash(m.avg)} · ${m.days.toFixed(0)}d` : fmtHash(m.avg);
 }
 
+/**
+ * Rotulo da media longa: "desde o inicio" so quando a serie alcanca o
+ * inicio de verdade; senao, a data em que ela comeca, para nao prometer o
+ * que nao mede.
+ */
+function rotuloDesdeInicio(m: MediaDesdeInicio | null, inicio: number | null): string {
+  if (!m || inicio === null || m.from - inicio <= 2 * 86_400_000) return 'Desde o inicio';
+  return `Desde ${new Date(m.from).toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' })}`;
+}
+
 export default function Dashboard() {
   const { data, error, isLoading } = useOverview();
   const now = useNow();
@@ -40,7 +54,7 @@ export default function Dashboard() {
       <Panel title="Falha de comunicacao">
         <p className="text-crit text-sm">{String(error.message ?? error)}</p>
         <p className="dim mt-2 text-xs">
-          Verifique a chave em .env.local e se o IP desta maquina esta no whitelist da ViaBTC.
+          Verifique a chave da pool em .env.local e, na ViaBTC, se o IP desta maquina esta no whitelist.
         </p>
       </Panel>
     );
@@ -120,6 +134,17 @@ export default function Dashboard() {
               />
               <KeyValue k="Media 7d" v={mediaLonga(t.hashrate7d, 7)} />
               <KeyValue k="Media 30d" v={mediaLonga(t.hashrate30d, 30)} />
+              <KeyValue
+                k={rotuloDesdeInicio(t.hashrateDesdeInicio, data.settings.miningStartedAt)}
+                v={
+                  t.hashrateDesdeInicio
+                    ? `${fmtHash(t.hashrateDesdeInicio.avg)}` +
+                      (t.hashrateDesdeInicio.pctNominal !== null
+                        ? ` · ${(t.hashrateDesdeInicio.pctNominal * 100).toFixed(0)}%`
+                        : '')
+                    : 'coletando…'
+                }
+              />
               <KeyValue k="Nominal" v={fmtHash(t.nominalTh)} />
               <div className="pt-2">
                 <div className="flex justify-between text-[0.68rem]">
@@ -136,7 +161,12 @@ export default function Dashboard() {
 
         <Panel title="Balanco do dia" right={cur}>
           <div className="grid grid-cols-2 gap-3">
-            <Stat label="Receita / dia" value={fmtMoney(revenue, cur, true)} sub={`${fmtBtc(t.revenueDayBtc)} BTC`} />
+            <Stat
+              label="Receita / dia"
+              value={fmtMoney(revenue, cur, true)}
+              sub={`${fmtBtc(t.revenueDayBtc)} BTC`}
+              hint={RITMO_24H}
+            />
             <Stat label="Energia / dia" value={fmtMoney(cost, cur, true)} sub={`${fmtNum(t.kwhDay, 0)} kWh`} />
             <Stat
               label="Lucro / dia"
@@ -144,6 +174,7 @@ export default function Dashboard() {
               sub={`${fmtMoney(profitOther, other, true)} · margem ${fmtPct(t.marginPct, 0)}`}
               tone={profit < 0 ? 'crit' : 'normal'}
               size="lg"
+              hint={RITMO_24H}
             />
             <Stat
               label="Projecao 30 dias"
@@ -311,7 +342,11 @@ export default function Dashboard() {
         <Panel title="Economia da mineracao" className="lg:col-span-2">
           <div className="grid grid-cols-1 gap-x-6 sm:grid-cols-2">
             <div>
-              <KeyValue k="Sats por TH/dia" v={fmtNum(t.satsPerThDay, 0)} />
+              <KeyValue
+                k="Sats por TH/dia"
+                v={fmtNum(t.satsPerThDay, 0)}
+                hint={`Pago pela pool sobre o que a fazenda entregou nos ultimos ${janelaDeReceita(data.pools.modos)} dias fechados`}
+              />
               <KeyValue k="Hashprice" v={`${fmtMoney(t.hashpriceUsd, 'USD')} /PH/dia`} />
               <KeyValue k="Custo por BTC minerado" v={fmtMoney(t.costPerBtcBrl, 'BRL', true)} />
               <KeyValue k="Custo por TH/dia" v={fmtMoney(t.costDayBrl / Math.max(1, t.hashrate1h), 'BRL')} />

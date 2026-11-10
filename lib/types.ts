@@ -1,76 +1,9 @@
 // Tipos compartilhados entre servidor e cliente.
 
-export interface ViaWorker {
-  worker_id: number;
-  worker_name: string;
-  group_id: number | null;
-  group_name: string | null;
-  coin: string;
-  hashrate_10min: string;
-  hashrate_1hour: string;
-  hashrate_24hour: string;
-  reject_rate: string;
-  online_time_7d?: string;
-  online_time_30d?: string;
-  online_time_60d?: string;
-  online_time_90d?: string;
-  last_active: number;
-  worker_status: 'active' | 'unactive' | string;
-}
+import type { ModoPagamento } from './pools/modo';
+import type { PoolChoice, PoolId } from './pools/types';
 
-export interface ViaAccountHashrate {
-  coin: string;
-  hashrate_10min: string;
-  hashrate_1hour: string;
-  hashrate_24hour: string;
-  active_workers: number;
-  unactive_workers: number;
-}
-
-export interface ViaProfitSummary {
-  coin: string;
-  total_profit: string;
-  pps_profit: string;
-  pplns_profit: string;
-  solo_profit: string;
-}
-
-export interface ViaProfitDay {
-  date: string;
-  coin: string;
-  pps_profit: string;
-  pplns_profit: string;
-  solo_profit: string;
-  total_profit: string;
-}
-
-export interface ViaPayment {
-  id: number;
-  coin: string;
-  amount: string;
-  address: string;
-  tx: string;
-  create_time: number;
-}
-
-export interface ViaAccount {
-  account: {
-    id: number;
-    parent_user_id: number | null;
-    create_time: number;
-    account: string;
-    email: string | null;
-  };
-  observer: { id: number; name: string; access_key: string; create_time: number }[];
-  withdraw_address: { coin: string; address: string }[];
-  balance: { coin: string; amount: string }[];
-}
-
-export interface ViaChartPoint {
-  timestamp: number;
-  hashrate: string;
-  reject_rate: string;
-}
+export type { PoolChoice, PoolId } from './pools/types';
 
 // ---------------------------------------------------------------- configuracao
 
@@ -121,6 +54,17 @@ export interface MinerConfig {
 }
 
 export interface Settings {
+  /**
+   * De qual pool o app le. 'ambas' serve a migracao: soma as duas e cada
+   * maquina vale pela pool em que entregou share por ultimo.
+   */
+  pool: PoolChoice;
+  /**
+   * Workers que a pool lista mas nao sao maquinas da fazenda — um teste de
+   * conexao, por exemplo, fica registrado na pool para sempre. Saem da
+   * leitura antes de tudo: sem snapshot, sem alerta, sem contrato, sem credito.
+   */
+  ignoredWorkers: string[];
   /** modelo padrao de custo de energia da fazenda */
   costModel: CostMode;
   /** custo fechado padrao por maquina, em USD por mes */
@@ -152,8 +96,23 @@ export interface Settings {
   fixedMonthlyCostBrl: number;
   /** eficiencia de referencia J/TH usada no assistente de configuracao */
   referenceJPerTh: number;
+  /**
+   * Quanto da perda por desempenho abaixo do nominal entra na fatura, em %.
+   *
+   * Nao e medicao, e acordo: a maquina degradada consumiu a energia e entregou
+   * menos, e a causa pode estar dos dois lados. Vale o que for combinado.
+   */
+  performanceSplitPct: number;
   /** primeiro dia de mineracao da fazenda, para o payback alcancar o inicio */
   miningStartedAt: number | null;
+  /**
+   * Avisar no Telegram cada bloco que a pool encontra.
+   *
+   * Desligado por padrao: uma pool grande acha mais de dez blocos por dia, e
+   * o canal existe para o que precisa de acao. O card da aba Rede mostra o
+   * mesmo sem custo de atencao.
+   */
+  telegramBlocks: boolean;
   /** avisa no Telegram: criticos e degradacao prolongada. Preencher = ligado */
   telegramToken: string;
   telegramChatId: string;
@@ -186,7 +145,9 @@ export interface PaybackInfo {
 }
 
 export interface MinerView {
-  workerId: number;
+  workerId: string;
+  /** pool em que a maquina entregou share por ultimo */
+  pool: PoolId;
   worker: string;
   label: string;
   location: string;
@@ -247,6 +208,27 @@ export interface Alert {
   since: number;
 }
 
+/** Bloco encontrado pela pool, identificado pela rede e nao pela pool. */
+export interface PoolBlock {
+  height: number;
+  ts: number;
+  rewardSats: number;
+  feesSats: number;
+  txCount: number;
+}
+
+/** Quanto a pool tem achado, e que fatia da rede isso representa. */
+export interface PoolBlockStats {
+  blocks24h: number | null;
+  blocks7d: number | null;
+  blocksAll: number | null;
+  share24hPct: number | null;
+  share7dPct: number | null;
+  /** hashrate estimado da pool, em H/s */
+  hashrate: number | null;
+  updatedAt: number;
+}
+
 export interface MarketData {
   btcUsd: number;
   btcBrl: number;
@@ -279,6 +261,18 @@ export interface MediaJanela {
   days: number;
 }
 
+/** Media desde o inicio da operacao, contra o nominal de cada momento. */
+export interface MediaDesdeInicio extends MediaJanela {
+  /** primeiro ponto com dado — depois do inicio quando a serie nao alcanca */
+  from: number;
+  /**
+   * Hashrate entregue sobre o nominal das maquinas que ja existiam em cada
+   * hora. Numa fazenda que cresceu com o tempo, comparar a media com o
+   * nominal de hoje daria um numero baixo que nao quer dizer nada.
+   */
+  pctNominal: number | null;
+}
+
 export interface FleetTotals {
   hashrate10m: number;
   hashrate1h: number;
@@ -289,6 +283,8 @@ export interface FleetTotals {
   hashrate7d: MediaJanela | null;
   /** media de 30 dias do hashrate da conta */
   hashrate30d: MediaJanela | null;
+  /** media desde o inicio da operacao, a partir da serie horaria da pool */
+  hashrateDesdeInicio: MediaDesdeInicio | null;
   nominalTh: number;
   performance: number;
   activeWorkers: number;
@@ -357,5 +353,15 @@ export interface OverviewPayload {
   revenueHistory: RevenueDay[];
   settings: Settings;
   poolStatus: { ok: boolean; message: string; lastSuccess: number | null };
+  /** de onde o painel esta lendo, e quais pools tem chave configurada */
+  pools: {
+    escolha: PoolChoice;
+    rotulo: string;
+    disponiveis: { id: PoolId; label: string; configurada: boolean }[];
+    /** modo de pagamento de cada pool ativa, deduzido do que ela pagou */
+    modos: ModoPagamento[];
+  };
+  /** blocos encontrados pela pool, e a fatia dela na rede */
+  poolBlocks: { recentes: PoolBlock[]; stats: PoolBlockStats | null };
   generatedAt: number;
 }

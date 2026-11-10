@@ -8,8 +8,8 @@ import type { Settings } from './types';
  * cada condicao avisa uma vez so, quando comeca, e avisa de novo quando
  * termina — sem o aviso de fim nao da para saber se o problema continua sem
  * abrir o painel; e quando muita coisa cai junto, tudo vai numa mensagem so,
- * porque uma queda geral disparando uma notificacao por maquina ensina o
- * dono a silenciar o bot.
+ * porque uma queda geral disparando uma notificacao por maquina ensina o dono a
+ * silenciar o bot.
  */
 
 export interface Aviso {

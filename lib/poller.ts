@@ -2,11 +2,14 @@ import {
   kvGet,
   kvSet,
   acumularFazendaBaixa,
+  marcarBlocosAvisados,
+  temBlocos,
   avgHashrateByWorker,
   degradedSinceMap,
   logEvent,
   markDegraded,
   persistMonthlyDowntime,
+  persistirPesosDiarios,
   recentHashrates,
   pruneOldData,
   upsertChart,
@@ -16,11 +19,13 @@ import {
   writeSnapshots,
   type SnapshotRow,
 } from './db';
+import { sincronizarBlocos } from './blocks';
 import { fetchMarket } from './market';
-import { hashrateRef, isDegraded, isOffline, pisosDeParada } from './health';
-import { avisosAbertos, despacharAvisos, type Aviso } from './notify';
+import { GRACE_SEM_SHARE_MS, hashrateRef, isDegraded, isOffline, pisosDeParada } from './health';
+import { avisosAbertos, despacharAvisos, sendTelegram, type Aviso } from './notify';
+import { lerGrafico, lerMaquinas, modoDaPool, poolPrincipal, poolsConfiguradas, rotuloFonte } from './pools';
+import { avisoDeBloco } from './pools/modo';
 import { getSettings, minerConfig, syncMiners } from './settings';
-import { num, toTh, viabtc } from './viabtc';
 
 export interface PollStatus {
   ok: boolean;
@@ -47,8 +52,8 @@ const FLEET_STEP_MAX_MS = 5 * 60_000;
  * Sem isso o alerta nunca sai numa fazenda real. Medindo em producao, o
  * conjunto oscila em torno do limite: cruza para cima varias vezes por turno
  * e o maior trecho continuo abaixo fica na casa da meia hora, ainda que o
- * tempo somado abaixo passe de um terco do dia. Exigir uma hora ininterrupta
- * era exigir uma falha que nao acontece.
+ * tempo somado abaixo passe de um terco do dia.
+ * Exigir uma hora ininterrupta era exigir uma falha que nao acontece.
  */
 const FLEET_GRACE_MS = 15 * 60_000;
 const globalRef = globalThis as unknown as { __minerWatchPoller?: NodeJS.Timeout; __minerWatchTick?: number };
@@ -89,16 +94,16 @@ export async function pollOnce(): Promise<PollStatus> {
   const ts = Date.now();
 
   try {
-    const [workers, account] = await Promise.all([viabtc.workers(), viabtc.accountHashrate()]);
+    const { workers, account, falhas } = await lerMaquinas(getSettings());
 
     const rows: SnapshotRow[] = workers.map((w) => ({
-      worker: w.worker_name,
-      workerId: w.worker_id,
-      h10m: toTh(w.hashrate_10min),
-      h1h: toTh(w.hashrate_1hour),
-      reject: num(w.reject_rate),
-      status: w.worker_status,
-      lastActive: w.last_active * 1000,
+      worker: w.name,
+      workerId: w.id,
+      h10m: w.h10m,
+      h1h: w.h1h,
+      reject: w.rejectPct,
+      status: w.status,
+      lastActive: w.lastActive,
     }));
 
     writeSnapshots(ts, rows);
@@ -114,6 +119,8 @@ export async function pollOnce(): Promise<PollStatus> {
     const degradadaDesde = degradedSinceMap();
     let nominalTotal = 0;
     let medidoTotal = 0;
+    /** hashrate instantaneo somado, para o mesmo teste que o credito usa */
+    let brutoTotal = 0;
     const deficit: { worker: string; fracao: number }[] = [];
 
     for (const r of rows) {
@@ -129,6 +136,7 @@ export async function pollOnce(): Promise<PollStatus> {
       if (cfg.enabled) {
         nominalTotal += cfg.nominalTh;
         medidoTotal += parada ? 0 : ref;
+        brutoTotal += r.h10m;
         // Maquina parada e assunto do credito de indisponibilidade, que ja
         // cobre as horas dela. Aqui entra so quem estava ligada entregando
         // menos, para as duas contas nunca cobrarem a mesma perda.
@@ -196,8 +204,17 @@ export async function pollOnce(): Promise<PollStatus> {
     // nominal — apareceria como o pior episodio de desempenho do mes, com o
     // host sendo cobrado duas vezes pela mesma janela. Por isso o episodio
     // tem relogio proprio, que so corre quando ha maquina ligada.
+    // Fazenda parada pelo mesmo criterio do credito: nenhuma maquina enviando
+    // share ha mais do que a carencia E o hashrate da conta no chao. Usar aqui
+    // um criterio mais frouxo — esperar os quinze minutos do offline — deixava
+    // os sete minutos do meio contados nas duas contas.
+    const pisos = pisosDeParada(settings);
+    const paradaGeral =
+      rows.length > 0 &&
+      rows.every((r) => ts - r.lastActive > GRACE_SEM_SHARE_MS) &&
+      brutoTotal < pisos.fazendaTh;
     const semProducao = deficit.length === 0;
-    const contaBaixa = fazendaAbaixo && !semProducao;
+    const contaBaixa = fazendaAbaixo && !semProducao && !paradaGeral;
     const baixaDesde = kvGet<number | null>(FLEET_LOW_FROM_KEY)?.value ?? null;
     if (contaBaixa && baixaDesde === null) kvSet(FLEET_LOW_FROM_KEY, ts);
     if (!contaBaixa && baixaDesde !== null) kvSet(FLEET_LOW_FROM_KEY, null);
@@ -349,10 +366,10 @@ export async function pollOnce(): Promise<PollStatus> {
     const rejectAvg = rows.length ? rows.reduce((s, r) => s + r.reject, 0) / rows.length : 0;
 
     writeFleetSnapshot(ts, {
-      h10m: toTh(account.hashrate_10min),
-      h1h: toTh(account.hashrate_1hour),
-      active: account.active_workers,
-      inactive: account.unactive_workers,
+      h10m: account.h10m,
+      h1h: account.h1h,
+      active: account.active,
+      inactive: account.inactive,
       reject: rejectAvg,
       btcUsd: market.btcUsd,
       btcBrl: market.btcBrl,
@@ -368,10 +385,16 @@ export async function pollOnce(): Promise<PollStatus> {
     const mes = `${agora.getFullYear()}-${String(agora.getMonth() + 1).padStart(2, '0')}`;
     const inicioMes = new Date(agora.getFullYear(), agora.getMonth(), 1).getTime();
     const fimMes = new Date(agora.getFullYear(), agora.getMonth() + 1, 1).getTime();
-    try {
-      persistMonthlyDowntime(mes, inicioMes, Math.min(ts + 1, fimMes), pisosDeParada(settings));
-    } catch (e) {
-      console.error('[miner-watch] falha ao consolidar indisponibilidade:', (e as Error).message);
+    // Percorrer o mes inteiro custa segundos de SQLite travado, e o SQLite e
+    // sincrono: enquanto roda, ninguem carrega o painel. O consolidado alimenta
+    // relatorio e cobranca, nao alerta, entao dez minutos de granularidade nao
+    // muda nada para quem le — e devolve 90% do tempo bloqueado.
+    if (tick === 1 || tick % 10 === 0) {
+      try {
+        persistMonthlyDowntime(mes, inicioMes, Math.min(ts + 1, fimMes), pisos);
+      } catch (e) {
+        console.error('[miner-watch] falha ao consolidar indisponibilidade:', (e as Error).message);
+      }
     }
 
     // A serie de 10 minutos da pool cobre 24h e a horaria cobre 3 dias.
@@ -379,64 +402,95 @@ export async function pollOnce(): Promise<PollStatus> {
     // anteriores a instalacao — apareçam no relatorio de indisponibilidade.
     if (tick === 1 || tick % 5 === 0) {
       const [min10, hourly] = await Promise.all([
-        viabtc.chart('min', 144).catch(() => []),
-        viabtc.chart('hour', 72).catch(() => []),
+        lerGrafico(settings, 'min', 24).catch(() => []),
+        lerGrafico(settings, 'hour', 72).catch(() => []),
       ]);
       if (min10.length) {
-        upsertChart(
-          'min',
-          min10.map((p) => ({ ts: p.timestamp * 1000, hashrate: toTh(p.hashrate), reject: num(p.reject_rate) })),
-        );
+        upsertChart('min', min10.map((p) => ({ ts: p.ts, hashrate: p.th, reject: p.rejectPct })));
       }
       if (hourly.length) {
-        upsertChart(
-          'hour',
-          hourly.map((p) => ({ ts: p.timestamp * 1000, hashrate: toTh(p.hashrate), reject: num(p.reject_rate) })),
-        );
+        upsertChart('hour', hourly.map((p) => ({ ts: p.ts, hashrate: p.th, reject: p.rejectPct })));
       }
     }
 
+    // Ganhos e pagamentos vem de toda pool com chave, nao so da escolhida: a
+    // pool que ficou para tras ainda fecha o ultimo dia e paga o saldo.
     if (tick === 1 || tick % 10 === 0) {
-      const [profits, pays] = await Promise.all([
-        viabtc.profitHistory(90).catch(() => []),
-        viabtc.paymentHistory(90).catch(() => []),
-      ]);
-      if (profits.length) {
-        upsertProfitDays(
-          profits.map((p) => ({
-            date: p.date,
-            total: num(p.total_profit),
-            pps: num(p.pps_profit),
-            pplns: num(p.pplns_profit),
-            solo: num(p.solo_profit),
-          })),
-        );
-      }
-      if (pays.length) {
-        upsertPayments(
-          pays.map((p) => ({
-            id: p.id,
-            amount: num(p.amount),
-            address: p.address,
-            tx: p.tx,
-            create_time: p.create_time * 1000,
-          })),
-        );
+      for (const pool of poolsConfiguradas()) {
+        const [profits, pays] = await Promise.all([
+          pool.profitHistory(90).catch(() => []),
+          pool.paymentHistory(90).catch(() => []),
+        ]);
+        if (profits.length) upsertProfitDays(pool.id, profits);
+        if (pays.length) {
+          upsertPayments(
+            pool.id,
+            pays.map((p) => ({ id: p.id, amount: p.amount, address: p.address, tx: p.tx, create_time: p.createdAt })),
+          );
+        }
       }
     }
-    if (tick % 1440 === 0) pruneOldData();
+    // Peso diario de cada maquina, guardado antes que a poda leve os
+    // snapshots. Na partida varre os 45 dias inteiros; depois, de hora em
+    // hora, so os ultimos dias, que e o que pode ter mudado.
+    if (tick === 1 || tick % 60 === 0) {
+      try {
+        persistirPesosDiarios(tick === 1 ? 46 : 3);
+      } catch (e) {
+        console.error('[miner-watch] falha ao gravar pesos diarios:', (e as Error).message);
+      }
+    }
+    if (tick % 1440 === 0) {
+      // A poda so vem depois de os pesos do periodo estarem gravados.
+      persistirPesosDiarios(46);
+      pruneOldData();
+    }
+
+    // Bloco leva ~10 minutos para aparecer na rede, entao olhar a cada 5
+    // ciclos avisa quase na hora sem martelar a fonte.
+    if (tick === 1 || tick % 5 === 0) {
+      try {
+        const slug = poolPrincipal(settings).mempoolSlug;
+        const primeira = !temBlocos(slug);
+        const novos = await sincronizarBlocos(slug, primeira);
+        if (novos.length > 0) {
+          // Registra o aviso mesmo com o canal desligado: ligar amanha nao
+          // pode despejar os blocos de hoje.
+          if (settings.telegramBlocks) {
+            const linhas = novos.map(
+              (b) =>
+                `  #${b.height}  ${(b.rewardSats / 1e8).toFixed(4)} BTC` +
+                ` (taxas ${(b.feesSats / 1e8).toFixed(4)})`,
+            );
+            const titulo =
+              novos.length === 1 ? 'BLOCO ENCONTRADO PELA POOL' : `${novos.length} BLOCOS ENCONTRADOS PELA POOL`;
+            const r = await sendTelegram(
+              settings,
+              `⛏️ ${titulo}\n\n${linhas.join('\n')}\n\n` + avisoDeBloco(modoDaPool(poolPrincipal(settings).id)),
+            );
+            if (!r.ok) console.error('[miner-watch] telegram falhou no bloco:', r.erro);
+          }
+          marcarBlocosAvisados(novos.map((b) => b.height));
+        }
+      } catch (e) {
+        console.error('[miner-watch] falha ao sincronizar blocos:', (e as Error).message);
+      }
+    }
 
     await despacharAvisos(settings, avisos);
 
+    const fonte = rotuloFonte(settings);
     const status: PollStatus = {
       ok: true,
-      message: `${rows.length} maquinas lidas`,
+      message:
+        `${rows.length} maquinas lidas (${fonte})` +
+        falhas.map((f) => ` · ${f.pool} falhou: ${f.erro}`).join(''),
       lastSuccess: ts,
       lastAttempt: ts,
       consecutiveErrors: 0,
     };
     kvSet(STATUS_KEY, status);
-    if (prev.consecutiveErrors > 0) logEvent('info', 'pool_recovered', null, 'Conexao com a ViaBTC restabelecida');
+    if (prev.consecutiveErrors > 0) logEvent('info', 'pool_recovered', null, `Conexao com a ${fonte} restabelecida`);
     return status;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -453,11 +507,13 @@ export async function pollOnce(): Promise<PollStatus> {
     // Tres falhas seguidas: passa de instabilidade momentanea a problema real.
     if (status.consecutiveErrors >= 3) {
       try {
-        await despacharAvisos(getSettings(), [
+        const settings = getSettings();
+        const fonte = rotuloFonte(settings);
+        await despacharAvisos(settings, [
           {
             id: 'pool-inacessivel',
-            texto: `🔴 SEM CONTATO COM A VIABTC\n${message}\n${status.consecutiveErrors} tentativas seguidas.`,
-            textoFim: '🟢 Conexao com a ViaBTC restabelecida.',
+            texto: `🔴 SEM CONTATO COM A ${fonte.toUpperCase()}\n${message}\n${status.consecutiveErrors} tentativas seguidas.`,
+            textoFim: `🟢 Conexao com a ${fonte} restabelecida.`,
           },
         ]);
       } catch {

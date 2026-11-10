@@ -2,6 +2,7 @@ import { kvGet, kvSet } from './db';
 import type { CostMode, MinerConfig, Settings } from './types';
 
 const KEY = 'settings';
+const POOLS_VALIDAS: string[] = ['viabtc', 'antpool', 'ambas'];
 
 /**
  * Padroes de partida, ajustaveis na tela de configuracoes.
@@ -16,6 +17,8 @@ export const DEFAULT_WATTS = Math.round(DEFAULT_NOMINAL_TH * DEFAULT_J_PER_TH);
 export const DEFAULT_PURCHASE_BRL = 10_000;
 
 export const DEFAULT_SETTINGS: Settings = {
+  pool: 'viabtc',
+  ignoredWorkers: [],
   costModel: 'tariff',
   fixedMonthlyUsdPerMiner: 0,
   tariffBrl: 0.85,
@@ -29,7 +32,9 @@ export const DEFAULT_SETTINGS: Settings = {
   alertDegradedMinutes: 60,
   fixedMonthlyCostBrl: 0,
   referenceJPerTh: DEFAULT_J_PER_TH,
+  performanceSplitPct: 50,
   miningStartedAt: null,
+  telegramBlocks: false,
   telegramToken: '',
   telegramChatId: '',
   miners: [],
@@ -107,6 +112,10 @@ export function getSettings(): Settings {
   return {
     ...DEFAULT_SETTINGS,
     ...stored,
+    pool: POOLS_VALIDAS.includes(stored.pool as string) ? (stored.pool as Settings['pool']) : DEFAULT_SETTINGS.pool,
+    ignoredWorkers: Array.isArray(stored.ignoredWorkers)
+      ? stored.ignoredWorkers.map((w) => String(w).trim()).filter(Boolean)
+      : [],
     miners: (stored.miners ?? []).map((m) => ({ ...defaultMiner(m.worker), ...m })),
   };
 }

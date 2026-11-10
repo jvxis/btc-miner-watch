@@ -4,7 +4,7 @@ import { useState } from 'react';
 import { KeyValue, Panel, Stat } from '@/components/ui';
 import { useEvents, useNow, useOverview, useSettings } from '@/lib/client';
 import { fmtBrl, fmtDate, fmtDateTime, fmtMoney, fmtNum, fmtUsd } from '@/lib/format';
-import type { CostMode, MinerConfig, Settings } from '@/lib/types';
+import type { CostMode, MinerConfig, PoolChoice, Settings } from '@/lib/types';
 
 function Field({
   label,
@@ -141,6 +141,56 @@ export default function SettingsPage() {
           />
         </Panel>
       </div>
+
+      {/* ---------------------------------------------------- pool */}
+      <Panel title="Pool de mineracao" right={overview?.pools ? `lendo de ${overview.pools.rotulo}` : undefined}>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Field
+            label="Ler os dados de"
+            hint="'as duas' serve a migracao: soma as pools e cada maquina vale pela pool onde mandou share por ultimo"
+          >
+            <select value={s.pool} onChange={(e) => set('pool', e.target.value as PoolChoice)}>
+              <option value="viabtc">ViaBTC</option>
+              <option value="antpool">AntPool</option>
+              <option value="ambas">As duas (durante a migracao)</option>
+            </select>
+          </Field>
+          <div className="space-y-0.5 self-end">
+            {(overview?.pools.disponiveis ?? []).map((p) => (
+              <KeyValue
+                key={p.id}
+                k={`Chave ${p.label}`}
+                v={p.configurada ? 'configurada' : 'ausente no .env.local'}
+                tone={p.configurada ? undefined : (s.pool === p.id || s.pool === 'ambas') ? 'crit' : 'warn'}
+              />
+            ))}
+          </div>
+        </div>
+        <div className="mt-3">
+          <Field
+            label="Workers ignorados"
+            hint="separados por virgula; a pool lista mas nao sao maquinas da fazenda (ex.: um teste de conexao)"
+          >
+            {/* Aplica ao sair do campo: dividir a cada tecla apagaria a virgula recem-digitada. */}
+            <input
+              type="text"
+              key={s.ignoredWorkers.join(',')}
+              defaultValue={s.ignoredWorkers.join(', ')}
+              onBlur={(e) =>
+                set(
+                  'ignoredWorkers',
+                  e.target.value.split(',').map((w) => w.trim()).filter(Boolean),
+                )
+              }
+            />
+          </Field>
+        </div>
+        <p className="mt-2 text-[0.62rem] dimmer">
+          Ganhos e pagamentos sao lidos de toda pool com chave, mesmo fora da selecao: a pool antiga ainda fecha o
+          ultimo dia e paga o saldo depois da troca. Os nomes das maquinas precisam ser os mesmos nas duas pools para
+          o historico continuar.
+        </p>
+      </Panel>
 
       {/* ---------------------------------------------------- energia */}
       <div className="grid gap-4 lg:grid-cols-2">
@@ -432,6 +482,22 @@ export default function SettingsPage() {
             Cada condicao avisa uma vez quando comeca e outra quando normaliza — nao repete a cada leitura. Queda
             passageira nao gera mensagem, e quando muita coisa cai junto tudo vai numa mensagem so.
           </p>
+          <label className="flex cursor-pointer items-start gap-2 border-t border-phos/15 pt-2">
+            <input
+              type="checkbox"
+              checked={s.telegramBlocks}
+              onChange={(e) => set('telegramBlocks', e.target.checked)}
+              className="!w-auto mt-[2px]"
+            />
+            <span>
+              <span className={s.telegramBlocks ? 'hot' : 'dim'}>Avisar cada bloco que a pool encontra</span>
+              <span className="block dimmer">
+                Uma pool grande acha mais de dez blocos por dia. Desligado, o card da aba Rede mostra o mesmo sem
+                custo de atencao.
+              </span>
+            </span>
+          </label>
+
           <p>
             Um terceiro aviso cobre o problema cronico: media da fazenda abaixo de {s.alertFleetPct}% ao longo de{' '}
             {s.alertChronicHours}h com alguma maquina degradada ha o mesmo tempo. Vem numa mensagem so, com a media
@@ -731,8 +797,9 @@ export default function SettingsPage() {
           <KeyValue k="Erros consecutivos" v={String(diag?.poller?.consecutiveErrors ?? 0)} />
           <KeyValue k="Amostras no banco" v={fmtNum(diag?.samples ?? 0)} />
           <div className="mt-3 border-t border-phos/15 pt-2 text-[0.62rem] dimmer">
-            Fonte: ViaBTC Pool API · o IP desta maquina precisa estar no whitelist da pagina de configuracoes de
-            mineracao da ViaBTC. Ao migrar para uma VPS, troque o IP la e reinicie o app.
+            Fonte: API da {overview?.pools.rotulo ?? 'pool'} · na ViaBTC, o IP desta maquina precisa estar no
+            whitelist da pagina de configuracoes de mineracao; a AntPool nao pede whitelist, mas bloqueia o IP que
+            passar de 600 chamadas em 10 minutos.
           </div>
         </Panel>
 
